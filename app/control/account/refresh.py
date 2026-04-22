@@ -18,7 +18,7 @@ from .quota_defaults import (
     supported_mode_ids,
     supports_mode,
 )
-from .state_machine import is_manageable
+from .state_machine import AccountFeedback, apply_feedback, is_manageable
 
 if TYPE_CHECKING:
     from .repository import AccountRepository
@@ -51,6 +51,60 @@ _MODE_KEYS = {
     3: "quota_heavy",
     4: "quota_grok_4_3",
 }
+
+
+def _patch_from_record_update(
+    record: AccountRecord,
+    updated: AccountRecord,
+) -> "AccountPatch":
+    from .commands import AccountPatch
+
+    patch: dict[str, object] = {"token": record.token}
+
+    if updated.status != record.status:
+        patch["status"] = updated.status
+    if updated.state_reason != record.state_reason:
+        patch["state_reason"] = updated.state_reason
+    if updated.last_fail_at != record.last_fail_at:
+        patch["last_fail_at"] = updated.last_fail_at
+    if updated.last_fail_reason != record.last_fail_reason:
+        patch["last_fail_reason"] = updated.last_fail_reason
+    if updated.last_sync_at != record.last_sync_at:
+        patch["last_sync_at"] = updated.last_sync_at
+    if updated.last_use_at != record.last_use_at:
+        patch["last_use_at"] = updated.last_use_at
+    if updated.last_clear_at != record.last_clear_at:
+        patch["last_clear_at"] = updated.last_clear_at
+
+    usage_fail_delta = updated.usage_fail_count - record.usage_fail_count
+    if usage_fail_delta:
+        patch["usage_fail_delta"] = usage_fail_delta
+    usage_use_delta = updated.usage_use_count - record.usage_use_count
+    if usage_use_delta:
+        patch["usage_use_delta"] = usage_use_delta
+    usage_sync_delta = updated.usage_sync_count - record.usage_sync_count
+    if usage_sync_delta:
+        patch["usage_sync_delta"] = usage_sync_delta
+
+    ext_merge = {
+        key: value
+        for key, value in updated.ext.items()
+        if record.ext.get(key) != value
+    }
+    if ext_merge:
+        patch["ext_merge"] = ext_merge
+
+    old_qs = record.quota_set()
+    new_qs = updated.quota_set()
+    for mode_id, key in _MODE_KEYS.items():
+        before = old_qs.get(mode_id)
+        after = new_qs.get(mode_id)
+        if before is None or after is None:
+            continue
+        if before.to_dict() != after.to_dict():
+            patch[key] = after.to_dict()
+
+    return AccountPatch(**patch)
 
 
 class AccountRefreshService:
@@ -381,33 +435,14 @@ class AccountRefreshService:
                     and getattr(exc, "status", None) == 429
                     and mode_id in _MODE_KEYS
                 ):
-                    now = now_ms()
-                    quota_patch: dict[str, dict] = {}
-                    window = record.quota_set().get(mode_id)
-                    if window is not None:
-                        reset_at = (
-                            window.reset_at
-                            if window.reset_at is not None and window.reset_at > now
-                            else now + max(window.window_seconds, 1) * 1000
-                        )
-                        quota_patch[_MODE_KEYS[mode_id]] = QuotaWindow(
-                            remaining=0,
-                            total=window.total,
-                            window_seconds=window.window_seconds,
-                            reset_at=reset_at,
-                            synced_at=window.synced_at,
-                            source=QuotaSource.ESTIMATED,
-                        ).to_dict()
+                    feedback = AccountFeedback.from_status_code(
+                        429,
+                        mode_id,
+                        reason="rate_limited",
+                    )
+                    updated = apply_feedback(record, feedback)
                     await self._repo.patch_accounts(
-                        [
-                            AccountPatch(
-                                token=token,
-                                usage_fail_delta=1,
-                                last_fail_at=now,
-                                last_fail_reason="rate_limited",
-                                **quota_patch,
-                            )
-                        ]
+                        [_patch_from_record_update(record, updated)]
                     )
                     return
             await self._repo.patch_accounts(
