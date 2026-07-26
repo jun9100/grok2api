@@ -93,7 +93,9 @@ type EgressProbeRunResult = { requested: number; healthy: number; unhealthy: num
 
 async function testAllEgressNodes(onProgress: (value: EgressProbeProgress) => void): Promise<EgressProbeRunResult> {
   const nodes = await listAllEgressNodes();
-  const ids = nodes.items.filter((node) => node.enabled && node.proxyConfigured).map((node) => node.id);
+  // Manual checks are diagnostic: include disabled nodes so an operator can
+  // inspect a proxy before deciding to return it to the scheduling pool.
+  const ids = nodes.items.filter((node) => node.proxyConfigured).map((node) => node.id);
   const result = { requested: 0, healthy: 0, unhealthy: 0, failed: 0 };
   let firstError: unknown;
   onProgress({ completed: 0, total: ids.length });
