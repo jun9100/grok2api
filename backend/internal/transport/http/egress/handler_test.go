@@ -2,6 +2,7 @@ package egress
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"net/http/httptest"
 	"strings"
@@ -156,5 +157,21 @@ func TestOperationsConfigRequestRejectsInvalidFallbackNodeID(t *testing.T) {
 	}).input()
 	if !errors.Is(err, egressapp.ErrInvalidInput) {
 		t.Fatalf("invalid node ID error = %v", err)
+	}
+}
+
+func TestNewSourceResponseUsesEmptyCountriesArrayWithoutFilter(t *testing.T) {
+	response := newSourceResponse(egressdomain.PublicSubscriptionSource{
+		ID: 1, Name: "source", Scope: egressdomain.ScopeBuild, Enabled: true,
+	})
+	if response.ImportFilter.Countries == nil {
+		t.Fatal("unconfigured import filter returned a nil countries slice")
+	}
+	data, err := json.Marshal(response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"countries":[]`) {
+		t.Fatalf("countries contract = %s", data)
 	}
 }
