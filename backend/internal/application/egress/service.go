@@ -45,11 +45,14 @@ type Input struct {
 }
 
 type ListFilter struct {
-	Scope       domain.Scope
-	Enabled     string
-	ProbeStatus string
-	Assignment  string
-	Sort        repository.SortQuery
+	Scope        domain.Scope
+	Enabled      string
+	ProbeStatus  string
+	Assignment   string
+	MaxLatencyMS *int
+	Country      string
+	IPType       string
+	Sort         repository.SortQuery
 }
 
 type ServiceRepository interface {
@@ -147,7 +150,9 @@ func (s *Service) List(ctx context.Context, page, pageSize int, search string, f
 	page, pageSize = repository.NormalizePage(page, pageSize, repository.DefaultPageSize)
 	if !validListScope(filter.Scope) || !validListValue(filter.Enabled, "enabled", "disabled") ||
 		!validListValue(filter.ProbeStatus, string(domain.ProbeStatusHealthy), string(domain.ProbeStatusUnhealthy), string(domain.ProbeStatusUnknown)) ||
-		!validListValue(filter.Assignment, "bound", "unbound") {
+		!validListValue(filter.Assignment, "bound", "unbound") ||
+		!validListValue(filter.IPType, "ipv4", "ipv6", "unknown") ||
+		(filter.MaxLatencyMS != nil && *filter.MaxLatencyMS < 0) {
 		return nil, 0, ErrInvalidFilter
 	}
 	if !repository.IsValidSort(filter.Sort, "name", "scope", "proxy", "clearance", "health") {
@@ -162,6 +167,7 @@ func (s *Service) List(ctx context.Context, page, pageSize int, search string, f
 		Page: repository.PageQuery{Offset: (page - 1) * pageSize, Limit: pageSize, Search: strings.TrimSpace(search), Sort: filter.Sort},
 		Filter: repository.EgressNodeListFilter{
 			Scope: filter.Scope, Enabled: enabled, ProbeStatus: domain.ProbeStatus(filter.ProbeStatus), Assignment: filter.Assignment,
+			MaxLatencyMS: filter.MaxLatencyMS, Country: strings.ToUpper(strings.TrimSpace(filter.Country)), IPType: filter.IPType,
 		},
 	})
 	if err != nil {
@@ -690,6 +696,7 @@ func (s *Service) applyInput(value domain.Node, input Input, create bool) (domai
 		value.LastProbedAt = nil
 		value.ProbeLatencyMS = 0
 		value.ExitIP = ""
+		value.ExitCountry = ""
 		value.ProbeError = ""
 		value.ProbeProvider = ""
 		value.IPv4Probe = domain.ProbeFamilyResult{Status: domain.ProbeStatusUnknown}
@@ -722,7 +729,8 @@ func (s *Service) publicNode(value domain.Node) domain.PublicNode {
 		AccountCapacity:   value.AccountCapacity,
 		AccountBoundProxy: accountBoundProxy,
 		Health:            health, FailureCount: failureCount, CooldownUntil: cooldownUntil, LastError: lastError,
-		ProbeStatus: value.ProbeStatus, LastProbedAt: value.LastProbedAt, ProbeLatencyMS: value.ProbeLatencyMS, ExitIP: value.ExitIP, ProbeError: value.ProbeError,
+		ProbeStatus: value.ProbeStatus, LastProbedAt: value.LastProbedAt, ProbeLatencyMS: value.ProbeLatencyMS,
+		ExitIP: value.ExitIP, ExitCountry: value.ExitCountry, ProbeError: value.ProbeError,
 		ProbeProvider: value.ProbeProvider,
 		IPv4Probe:     value.IPv4Probe, IPv6Probe: value.IPv6Probe,
 		AssignedAccountCount: value.AssignedAccountCount,

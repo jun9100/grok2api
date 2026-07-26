@@ -78,8 +78,8 @@ func TestEgressRepositoryPaginatesAndFiltersManagementList(t *testing.T) {
 	repo := NewEgressRepository(database)
 	created := make(map[string]egress.Node)
 	for _, value := range []egress.Node{
-		{Name: "alpha", Scope: egress.ScopeBuild, Enabled: true, Health: 0.9, ProbeStatus: egress.ProbeStatusHealthy},
-		{Name: "beta", Scope: egress.ScopeWeb, Enabled: false, Health: 0.4, ProbeStatus: egress.ProbeStatusUnhealthy},
+		{Name: "alpha", Scope: egress.ScopeBuild, Enabled: true, Health: 0.9, ProbeStatus: egress.ProbeStatusHealthy, ProbeLatencyMS: 80, ExitIP: "198.51.100.10", ExitCountry: "US"},
+		{Name: "beta", Scope: egress.ScopeWeb, Enabled: false, Health: 0.4, ProbeStatus: egress.ProbeStatusUnhealthy, ProbeLatencyMS: 240, ExitIP: "2001:db8::10", ExitCountry: "DE"},
 		{Name: "gamma", Scope: egress.ScopeBuild, Enabled: true, Health: 0.7, ProbeStatus: egress.ProbeStatusUnknown},
 	} {
 		node, createErr := repo.CreateEgressNode(ctx, value)
@@ -129,6 +129,42 @@ func TestEgressRepositoryPaginatesAndFiltersManagementList(t *testing.T) {
 	})
 	if err != nil || total != 1 || len(values) != 1 || values[0].Name != "beta" {
 		t.Fatalf("disabled unbound page = %#v, total=%d, err=%v", values, total, err)
+	}
+
+	maxLatency := 100
+	values, total, err = repo.ListEgressNodePage(ctx, repository.EgressNodeListQuery{
+		Page: repository.PageQuery{Limit: 20}, Filter: repository.EgressNodeListFilter{MaxLatencyMS: &maxLatency},
+	})
+	if err != nil || total != 1 || len(values) != 1 || values[0].Name != "alpha" {
+		t.Fatalf("latency filtered page = %#v, total=%d, err=%v", values, total, err)
+	}
+
+	values, total, err = repo.ListEgressNodePage(ctx, repository.EgressNodeListQuery{
+		Page: repository.PageQuery{Limit: 20}, Filter: repository.EgressNodeListFilter{Country: "US"},
+	})
+	if err != nil || total != 1 || len(values) != 1 || values[0].Name != "alpha" {
+		t.Fatalf("country filtered page = %#v, total=%d, err=%v", values, total, err)
+	}
+
+	values, total, err = repo.ListEgressNodePage(ctx, repository.EgressNodeListQuery{
+		Page: repository.PageQuery{Limit: 20}, Filter: repository.EgressNodeListFilter{Country: "UNKNOWN"},
+	})
+	if err != nil || total != 1 || len(values) != 1 || values[0].Name != "gamma" {
+		t.Fatalf("unknown country page = %#v, total=%d, err=%v", values, total, err)
+	}
+
+	values, total, err = repo.ListEgressNodePage(ctx, repository.EgressNodeListQuery{
+		Page: repository.PageQuery{Limit: 20}, Filter: repository.EgressNodeListFilter{IPType: "ipv6"},
+	})
+	if err != nil || total != 1 || len(values) != 1 || values[0].Name != "beta" {
+		t.Fatalf("IPv6 filtered page = %#v, total=%d, err=%v", values, total, err)
+	}
+
+	values, total, err = repo.ListEgressNodePage(ctx, repository.EgressNodeListQuery{
+		Page: repository.PageQuery{Limit: 20}, Filter: repository.EgressNodeListFilter{IPType: "unknown"},
+	})
+	if err != nil || total != 1 || len(values) != 1 || values[0].Name != "gamma" {
+		t.Fatalf("unknown IP filtered page = %#v, total=%d, err=%v", values, total, err)
 	}
 }
 

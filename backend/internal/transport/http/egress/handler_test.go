@@ -78,6 +78,39 @@ func TestParseBoundedEgressNodeIDsChecksRawInputLength(t *testing.T) {
 	}
 }
 
+func TestParseEgressMaxLatency(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		raw     string
+		want    *int
+		wantErr bool
+	}{
+		{name: "empty", raw: ""},
+		{name: "zero", raw: "0", want: pointerTo(0)},
+		{name: "positive", raw: "300", want: pointerTo(300)},
+		{name: "negative", raw: "-1", wantErr: true},
+		{name: "non numeric", raw: "fast", wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			actual, err := parseEgressMaxLatency(test.raw)
+			if test.wantErr {
+				if !errors.Is(err, egressapp.ErrInvalidFilter) {
+					t.Fatalf("error = %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if (actual == nil) != (test.want == nil) || actual != nil && *actual != *test.want {
+				t.Fatalf("value = %v, want %v", actual, test.want)
+			}
+		})
+	}
+}
+
+func pointerTo(value int) *int { return &value }
+
 func TestNewNodeResponseIncludesIPv4AndIPv6ProbeDetails(t *testing.T) {
 	testedAt := time.Now().UTC().Truncate(time.Second)
 	response := newNodeResponse(egressdomain.PublicNode{

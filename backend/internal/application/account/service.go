@@ -257,6 +257,9 @@ type Summary struct {
 type ProviderSummary struct {
 	Total     int64
 	Available int64
+	Recovery  RecoverySummary
+	Issues    IssueSummary
+	Risk      int64
 }
 
 type RecoverySummary struct {
@@ -287,7 +290,11 @@ func (s *Service) Summary(ctx context.Context) (Summary, error) {
 		result.Recovery.Probing += row.Probing
 		result.Issues.Disabled += row.Disabled
 		result.Issues.ReauthRequired += row.ReauthRequired
-		result.Providers[row.Provider] = ProviderSummary{Total: row.Total, Available: row.Available}
+		result.Providers[row.Provider] = ProviderSummary{
+			Total: row.Total, Available: row.Available,
+			Recovery: RecoverySummary{Cooldown: row.Cooldown, WaitingReset: row.WaitingReset, Probing: row.Probing},
+			Issues:   IssueSummary{Disabled: row.Disabled, ReauthRequired: row.ReauthRequired},
+		}
 	}
 	result.Recovering = result.Recovery.Cooldown + result.Recovery.WaitingReset + result.Recovery.Probing
 	result.Attention = result.Issues.Disabled + result.Issues.ReauthRequired
@@ -296,6 +303,9 @@ func (s *Service) Summary(ctx context.Context) (Summary, error) {
 		return Summary{}, err
 	}
 	result.Risk = int64(len(flaggedIDs))
+	build := result.Providers[string(accountdomain.ProviderBuild)]
+	build.Risk = result.Risk
+	result.Providers[string(accountdomain.ProviderBuild)] = build
 	return result, nil
 }
 

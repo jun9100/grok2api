@@ -19,7 +19,7 @@ type DataTableTextFilter = {
   value: string;
   placeholder?: string;
   onChange: (value: string) => void;
-  type: "text";
+  type: "text" | "number";
 };
 
 export type DataTableFilter = DataTableOptionFilter | DataTableTextFilter;
@@ -50,6 +50,7 @@ export function DataTableFilters({ filters }: { filters: DataTableFilter[] }) {
                   <Input
                     id={`table-filter-${filter.id}`}
                     className="h-8 text-xs"
+                    type={filter.type}
                     value={filter.value}
                     placeholder={filter.placeholder}
                     aria-label={filter.label}

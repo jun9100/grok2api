@@ -34,10 +34,13 @@ type EgressNodeUnhealthyCleaner interface {
 }
 
 type EgressNodeListFilter struct {
-	Scope       egress.Scope
-	Enabled     *bool
-	ProbeStatus egress.ProbeStatus
-	Assignment  string
+	Scope        egress.Scope
+	Enabled      *bool
+	ProbeStatus  egress.ProbeStatus
+	Assignment   string
+	MaxLatencyMS *int
+	Country      string
+	IPType       string
 }
 
 type EgressNodeListQuery struct {

@@ -59,6 +59,24 @@ func (r *EgressRepository) ListEgressNodePage(ctx context.Context, input reposit
 	if input.Filter.ProbeStatus != "" {
 		query = query.Where("egress_nodes.probe_status = ?", input.Filter.ProbeStatus)
 	}
+	if input.Filter.MaxLatencyMS != nil {
+		query = query.Where("egress_nodes.probe_status = ? AND egress_nodes.probe_latency_ms <= ?", egress.ProbeStatusHealthy, *input.Filter.MaxLatencyMS)
+	}
+	switch input.Filter.Country {
+	case "UNKNOWN":
+		query = query.Where("TRIM(COALESCE(egress_nodes.exit_country, '')) = ''")
+	case "":
+	default:
+		query = query.Where("UPPER(TRIM(COALESCE(egress_nodes.exit_country, ''))) = ?", input.Filter.Country)
+	}
+	switch input.Filter.IPType {
+	case "ipv4":
+		query = query.Where("INSTR(egress_nodes.exit_ip, ':') = 0 AND INSTR(egress_nodes.exit_ip, '.') > 0")
+	case "ipv6":
+		query = query.Where("INSTR(egress_nodes.exit_ip, ':') > 0")
+	case "unknown":
+		query = query.Where("TRIM(COALESCE(egress_nodes.exit_ip, '')) = '' OR (INSTR(egress_nodes.exit_ip, ':') = 0 AND INSTR(egress_nodes.exit_ip, '.') = 0)")
+	}
 	switch input.Filter.Assignment {
 	case "bound":
 		query = query.Where("EXISTS (SELECT 1 FROM provider_accounts account WHERE account.egress_node_id = egress_nodes.id)")
@@ -228,7 +246,7 @@ func (r *EgressRepository) UpdateEgressNodeProbe(ctx context.Context, id uint64,
 		Where("id = ? AND encrypted_proxy_url = ?", id, expectedEncryptedProxyURL).
 		Updates(map[string]any{
 			"probe_status": value.Status, "last_probed_at": value.TestedAt.UTC(),
-			"probe_latency_ms": value.LatencyMS, "exit_ip": value.ExitIP, "probe_error": value.Error, "probe_provider": storedProbeProvider(value.Provider),
+			"probe_latency_ms": value.LatencyMS, "exit_ip": value.ExitIP, "exit_country": value.ExitCountry, "probe_error": value.Error, "probe_provider": storedProbeProvider(value.Provider),
 			"ipv4_probe_status": normalizedProbeStatus(value.IPv4.Status), "ipv4_last_probed_at": probeTestedAt(value.IPv4),
 			"ipv4_probe_latency_ms": value.IPv4.LatencyMS, "ipv4_exit_ip": value.IPv4.ExitIP, "ipv4_probe_error": value.IPv4.Error,
 			"ipv6_probe_status": normalizedProbeStatus(value.IPv6.Status), "ipv6_last_probed_at": probeTestedAt(value.IPv6),
@@ -720,7 +738,7 @@ func toEgressDomain(row egressNodeModel) egress.Node {
 		ClearanceRefreshedAt: row.ClearanceRefreshedAt, ClearanceFingerprint: row.ClearanceFingerprint,
 		ClearanceBindingFingerprint: row.ClearanceBindingFingerprint,
 		Health:                      row.Health, FailureCount: row.FailureCount, CooldownUntil: row.CooldownUntil, LastError: row.LastError,
-		ProbeStatus: egress.ProbeStatus(row.ProbeStatus), LastProbedAt: row.LastProbedAt, ProbeLatencyMS: row.ProbeLatencyMS, ExitIP: row.ExitIP, ProbeError: row.ProbeError,
+		ProbeStatus: egress.ProbeStatus(row.ProbeStatus), LastProbedAt: row.LastProbedAt, ProbeLatencyMS: row.ProbeLatencyMS, ExitIP: row.ExitIP, ExitCountry: row.ExitCountry, ProbeError: row.ProbeError,
 		ProbeProvider: storedProbeProvider(egress.ProbeProvider(row.ProbeProvider)),
 		IPv4Probe:     probeFamilyFromRow(row.IPv4ProbeStatus, row.IPv4LastProbedAt, row.IPv4ProbeLatencyMS, row.IPv4ExitIP, row.IPv4ProbeError),
 		IPv6Probe:     probeFamilyFromRow(row.IPv6ProbeStatus, row.IPv6LastProbedAt, row.IPv6ProbeLatencyMS, row.IPv6ExitIP, row.IPv6ProbeError),
@@ -744,7 +762,7 @@ func fromEgressDomain(value egress.Node) egressNodeModel {
 		ClearanceRefreshedAt: value.ClearanceRefreshedAt, ClearanceFingerprint: value.ClearanceFingerprint,
 		ClearanceBindingFingerprint: value.ClearanceBindingFingerprint,
 		Health:                      health, FailureCount: value.FailureCount, CooldownUntil: value.CooldownUntil, LastError: value.LastError,
-		ProbeStatus: string(probeStatus), LastProbedAt: value.LastProbedAt, ProbeLatencyMS: value.ProbeLatencyMS, ExitIP: value.ExitIP, ProbeError: value.ProbeError,
+		ProbeStatus: string(probeStatus), LastProbedAt: value.LastProbedAt, ProbeLatencyMS: value.ProbeLatencyMS, ExitIP: value.ExitIP, ExitCountry: value.ExitCountry, ProbeError: value.ProbeError,
 		ProbeProvider:   string(storedProbeProvider(value.ProbeProvider)),
 		IPv4ProbeStatus: string(normalizedProbeStatus(value.IPv4Probe.Status)), IPv4LastProbedAt: probeTestedAt(value.IPv4Probe), IPv4ProbeLatencyMS: value.IPv4Probe.LatencyMS, IPv4ExitIP: value.IPv4Probe.ExitIP, IPv4ProbeError: value.IPv4Probe.Error,
 		IPv6ProbeStatus: string(normalizedProbeStatus(value.IPv6Probe.Status)), IPv6LastProbedAt: probeTestedAt(value.IPv6Probe), IPv6ProbeLatencyMS: value.IPv6Probe.LatencyMS, IPv6ExitIP: value.IPv6Probe.ExitIP, IPv6ProbeError: value.IPv6Probe.Error,
