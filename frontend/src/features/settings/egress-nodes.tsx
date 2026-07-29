@@ -18,8 +18,9 @@ import { Switch } from "@/components/ui/switch";
 import { Table, TableActionCell, TableActionHead, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Textarea } from "@/components/ui/textarea";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import { EgressAutomation, EgressSources } from "@/features/settings/egress-operations";
-import { cleanupUnhealthyEgressNodes, createEgressNode, deleteEgressNode, deleteEgressNodes, importEgressText, listAllEgressNodes, listEgressNodes, previewUnhealthyEgressNodes, refreshEgressClearance, testEgressNode, updateEgressNode, updateEgressNodesEnabled, type EgressIPProbeDTO, type EgressNodeDTO, type EgressNodeInput, type EgressScope } from "@/features/settings/settings-api";
+import { EgressAutomation, EgressImportFilterControls, EgressSources } from "@/features/settings/egress-operations";
+import { type EgressImportFilterForm, toEgressImportFilterInput } from "@/features/settings/egress-import-filter";
+import { cleanupUnhealthyEgressNodes, createEgressNode, deleteEgressNode, deleteEgressNodes, importEgressText, listAllEgressNodes, listEgressNodes, previewUnhealthyEgressNodes, refreshEgressClearance, testEgressNode, updateEgressNode, updateEgressNodesEnabled, type EgressIPProbeDTO, type EgressNodeDTO, type EgressNodeInput, type EgressScope, type EgressTextImportInput } from "@/features/settings/settings-api";
 import { ErrorState, TableLoadingRow } from "@/shared/components/data-state";
 import { DataTableShell } from "@/shared/components/data-table-shell";
 import { DataTableFilters } from "@/shared/components/data-table-filters";
@@ -31,8 +32,8 @@ import { cn } from "@/shared/lib/cn";
 import { nextTableSort, type SortOrder, type TableSort } from "@/shared/lib/table-sort";
 
 const emptyInput: EgressNodeInput = { name: "", scope: "grok_build", enabled: true, proxyPool: false, accountCapacity: 0, proxyURL: "", userAgent: "", cloudflareCookies: "" };
-type ImportForm = { name: string; scope: EgressScope; accountCapacity: number; content: string };
-const emptyImport: ImportForm = { name: "", scope: "grok_build", accountCapacity: 0, content: "" };
+type ImportForm = Omit<EgressTextImportInput, "importFilter"> & { importFilter: EgressImportFilterForm };
+const emptyImport: ImportForm = { name: "", scope: "grok_build", accountCapacity: 0, content: "", importFilter: { maxLatencyMs: 0, countries: "" } };
 
 export function EgressNodes({ title, clearanceMode }: { title: string; clearanceMode: "manual" | "flaresolverr" }) {
   const { t } = useTranslation();
@@ -83,7 +84,7 @@ export function EgressNodes({ title, clearanceMode }: { title: string; clearance
     onError: (error) => showError(error, t("settings.egress.operationFailed")),
   });
   const importText = useMutation({
-    mutationFn: () => importEgressText(importForm),
+    mutationFn: () => importEgressText({ ...importForm, importFilter: toEgressImportFilterInput(importForm.importFilter) }),
     onSuccess: (value) => { void queryClient.invalidateQueries({ queryKey: ["egress-nodes"] }); setImportOpen(false); toast.success(t("settings.egress.imported", value)); },
     onError: (error) => showError(error, t("settings.egress.operationFailed")),
   });
@@ -471,6 +472,7 @@ export function EgressNodes({ title, clearanceMode }: { title: string; clearance
               </Field>
             </div>
             <Field label={t("settings.egress.capacity")} controlId="egress-import-capacity"><Input id="egress-import-capacity" type="number" min={0} max={100000} placeholder={t("settings.egress.unlimited")} value={importForm.accountCapacity || ""} onChange={(event) => setImportForm({ ...importForm, accountCapacity: Number(event.target.value) })} /></Field>
+            <EgressImportFilterControls value={importForm.importFilter} onChange={(importFilter) => setImportForm({ ...importForm, importFilter })} />
             <Field label={t("settings.egress.proxyList")} controlId="egress-import-list"><Textarea className="min-h-52 font-mono text-xs" id="egress-import-list" value={importForm.content} onChange={(event) => setImportForm({ ...importForm, content: event.target.value })} /></Field>
             <DialogFooter><Button type="button" size="sm" variant="secondary" onClick={() => setImportOpen(false)}>{t("common.cancel")}</Button><Button type="submit" size="sm" disabled={!importForm.name.trim() || !importForm.content.trim() || importText.isPending}>{importText.isPending ? <Spinner /> : null}{t("settings.egress.importText")}</Button></DialogFooter>
           </form>

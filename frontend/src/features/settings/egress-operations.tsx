@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { CircleAlert, CircleHelp, MoreHorizontal, Network, Pencil, Plus, RefreshCw, Search, Shuffle, Trash2, Upload } from "lucide-react";
+import { CircleAlert, CircleHelp, MoreHorizontal, Network, Pencil, Plus, RefreshCw, Search, Shuffle, Trash2 } from "lucide-react";
 import { useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
@@ -14,13 +14,12 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Spinner } from "@/components/ui/spinner";
 import { Switch } from "@/components/ui/switch";
 import { Table, TableActionCell, TableActionHead, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { Textarea } from "@/components/ui/textarea";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { type EgressImportFilterForm, toEgressImportFilterInput } from "@/features/settings/egress-import-filter";
 import {
   createEgressSource,
   deleteEgressSource,
   getEgressOperationsConfig,
-  importEgressText,
   listAllEgressNodes,
   listEgressSources,
   rebalanceEgressAccounts,
@@ -38,7 +37,6 @@ import {
   type EgressScope,
   type EgressSourceDTO,
   type EgressSourceInput,
-  type EgressTextImportInput,
 } from "@/features/settings/settings-api";
 import { formatDateTime } from "@/shared/lib/format";
 import { ErrorState, LoadingState, TableLoadingRow } from "@/shared/components/data-state";
@@ -47,14 +45,11 @@ import { DataTableShell } from "@/shared/components/data-table-shell";
 import { Pagination } from "@/shared/components/pagination";
 import { VirtualTableBody } from "@/shared/components/virtual-table-body";
 
-type ImportFilterForm = { maxLatencyMs: number; countries: string };
-type SourceForm = Omit<EgressSourceInput, "importFilter"> & { url: string; importFilter: ImportFilterForm };
-type ImportForm = Omit<EgressTextImportInput, "importFilter"> & { importFilter: ImportFilterForm };
+type SourceForm = Omit<EgressSourceInput, "importFilter"> & { url: string; importFilter: EgressImportFilterForm };
 const emptySource: SourceForm = {
   name: "", scope: "grok_build", enabled: true, url: "", refreshIntervalSeconds: 900, defaultAccountCapacity: 0,
   importFilter: { maxLatencyMs: 0, countries: "" },
 };
-const emptyImport: ImportForm = { name: "", scope: "grok_build", accountCapacity: 0, content: "", importFilter: { maxLatencyMs: 0, countries: "" } };
 // Eight nodes run concurrently; each checks IPv4 and IPv6 in parallel with a
 // 15-second ceiling. Keeping a request to 32 nodes leaves enough headroom for
 // the admin HTTP timeout.
@@ -67,15 +62,8 @@ const fallbackDescriptionKeys: Record<EgressScope, string> = {
   grok_web_asset: "settings.egress.fallbackWebAssetHelp",
 };
 
-function importFilterForm(value?: EgressImportFilterInput): ImportFilterForm {
+function importFilterForm(value?: EgressImportFilterInput): EgressImportFilterForm {
   return { maxLatencyMs: value?.maxLatencyMs ?? 0, countries: value?.countries.join(", ") ?? "" };
-}
-
-function importFilterInput(value: ImportFilterForm): EgressImportFilterInput {
-  return {
-    maxLatencyMs: Math.max(0, Number.isFinite(value.maxLatencyMs) ? value.maxLatencyMs : 0),
-    countries: value.countries.split(/[,，]/).map((country) => country.trim()).filter(Boolean),
-  };
 }
 
 function defaultFallbacks(): Record<EgressScope, EgressFallbackConfigDTO> {
@@ -303,8 +291,6 @@ export function EgressSources({ scopeLabel }: { scopeLabel: (scope: EgressScope)
   const queryClient = useQueryClient();
   const [sourceEditing, setSourceEditing] = useState<EgressSourceDTO | null | undefined>(undefined);
   const [sourceForm, setSourceForm] = useState<SourceForm>(emptySource);
-  const [importOpen, setImportOpen] = useState(false);
-  const [importForm, setImportForm] = useState<ImportForm>(emptyImport);
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(20);
   const [search, setSearch] = useState("");
@@ -324,7 +310,7 @@ export function EgressSources({ scopeLabel }: { scopeLabel: (scope: EgressScope)
         url: sourceForm.url.trim() || undefined,
         refreshIntervalSeconds: sourceForm.refreshIntervalSeconds,
         defaultAccountCapacity: sourceForm.defaultAccountCapacity,
-        importFilter: importFilterInput(sourceForm.importFilter),
+        importFilter: toEgressImportFilterInput(sourceForm.importFilter),
       };
       return sourceEditing ? updateEgressSource(sourceEditing.id, input) : createEgressSource(input);
     },
@@ -339,11 +325,6 @@ export function EgressSources({ scopeLabel }: { scopeLabel: (scope: EgressScope)
   const syncSource = useMutation({
     mutationFn: syncEgressSource,
     onSuccess: (value) => { invalidate(); toast.success(t("settings.egress.sourceSynced", value)); },
-    onError: showError,
-  });
-  const importText = useMutation({
-    mutationFn: () => importEgressText({ ...importForm, importFilter: importFilterInput(importForm.importFilter) }),
-    onSuccess: (value) => { invalidate(); setImportOpen(false); toast.success(t("settings.egress.imported", value)); },
     onError: showError,
   });
 
@@ -392,7 +373,6 @@ export function EgressSources({ scopeLabel }: { scopeLabel: (scope: EgressScope)
                 ],
               }]} />
             </div>
-            <ActionTooltip label={t("settings.egress.importTextHelp")}><Button type="button" size="sm" variant="secondary" onClick={() => { setImportForm(emptyImport); setImportOpen(true); }}><Upload />{t("settings.egress.importText")}</Button></ActionTooltip>
             <ActionTooltip label={t("settings.egress.addSourceHelp")}><Button type="button" size="sm" variant="secondary" onClick={() => openSource()}><Plus />{t("settings.egress.addSource")}</Button></ActionTooltip>
           </>
         )}
@@ -435,24 +415,12 @@ export function EgressSources({ scopeLabel }: { scopeLabel: (scope: EgressScope)
               <Control label={t("settings.egress.refreshInterval")}><Input type="number" min={60} max={86400} value={sourceForm.refreshIntervalSeconds} onChange={(event) => setSourceForm({ ...sourceForm, refreshIntervalSeconds: Number(event.target.value) })} /></Control>
               <Control label={t("settings.egress.capacity")}><Input type="number" min={0} max={100000} placeholder={t("settings.egress.unlimited")} value={sourceForm.defaultAccountCapacity || ""} onChange={(event) => setSourceForm({ ...sourceForm, defaultAccountCapacity: Number(event.target.value) })} /></Control>
             </div>
-            <ImportFilterControls value={sourceForm.importFilter} onChange={(importFilter) => setSourceForm({ ...sourceForm, importFilter })} />
+            <EgressImportFilterControls value={sourceForm.importFilter} onChange={(importFilter) => setSourceForm({ ...sourceForm, importFilter })} />
             <DialogFooter><Button type="button" size="sm" variant="secondary" onClick={() => setSourceEditing(undefined)}>{t("common.cancel")}</Button><Button type="submit" size="sm" disabled={!sourceForm.name.trim() || (!sourceEditing && !sourceForm.url.trim()) || saveSource.isPending}>{saveSource.isPending ? <Spinner /> : null}{t("common.save")}</Button></DialogFooter>
           </form>
         </DialogContent>
       </Dialog>
 
-      <Dialog open={importOpen} onOpenChange={setImportOpen}>
-        <DialogContent className="max-h-[calc(100svh-2rem)] overflow-y-auto sm:max-w-[620px]">
-          <DialogHeader className="pr-8"><DialogTitle>{t("settings.egress.importText")}</DialogTitle><DialogDescription>{t("settings.egress.importDialogDescription")}</DialogDescription></DialogHeader>
-          <form className="space-y-3.5" onSubmit={(event) => { event.preventDefault(); event.stopPropagation(); importText.mutate(); }}>
-            <div className="grid gap-3 sm:grid-cols-2"><Control label={t("settings.egress.name")}><Input value={importForm.name} onChange={(event) => setImportForm({ ...importForm, name: event.target.value })} /></Control><Control label={t("settings.egress.scope")}><ScopeSelect value={importForm.scope} onChange={(scope) => setImportForm({ ...importForm, scope })} scopeLabel={scopeLabel} /></Control></div>
-            <Control label={t("settings.egress.capacity")}><Input type="number" min={0} max={100000} placeholder={t("settings.egress.unlimited")} value={importForm.accountCapacity || ""} onChange={(event) => setImportForm({ ...importForm, accountCapacity: Number(event.target.value) })} /></Control>
-            <ImportFilterControls value={importForm.importFilter} onChange={(importFilter) => setImportForm({ ...importForm, importFilter })} />
-            <Control label={t("settings.egress.proxyList")}><Textarea className="min-h-52 font-mono text-xs" value={importForm.content} onChange={(event) => setImportForm({ ...importForm, content: event.target.value })} /></Control>
-            <DialogFooter><Button type="button" size="sm" variant="secondary" onClick={() => setImportOpen(false)}>{t("common.cancel")}</Button><Button type="submit" size="sm" disabled={!importForm.name.trim() || !importForm.content.trim() || importText.isPending}>{importText.isPending ? <Spinner /> : null}{t("settings.egress.importText")}</Button></DialogFooter>
-          </form>
-        </DialogContent>
-      </Dialog>
     </section>
   );
 }
@@ -530,7 +498,7 @@ function SourceImportFilter({ filter }: { filter: EgressImportFilterInput }) {
   return <span className="block truncate">{values.length > 0 ? values.join(" · ") : t("settings.egress.noImportFilter")}</span>;
 }
 
-function ImportFilterControls({ value, onChange }: { value: ImportFilterForm; onChange: (value: ImportFilterForm) => void }) {
+export function EgressImportFilterControls({ value, onChange }: { value: EgressImportFilterForm; onChange: (value: EgressImportFilterForm) => void }) {
   const { t } = useTranslation();
   const enabled = value.maxLatencyMs > 0 || value.countries.trim() !== "";
   return (
