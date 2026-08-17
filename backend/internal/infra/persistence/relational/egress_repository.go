@@ -312,7 +312,7 @@ func probeIPObservations(value egress.ProbeResult) []probeIPObservation {
 			return
 		}
 		address, err := netip.ParseAddr(strings.TrimSpace(candidate.ExitIP))
-		if err != nil || !address.IsGlobalUnicast() {
+		if err != nil || !isPublicEgressIP(address) {
 			return
 		}
 		family := "ipv6"
@@ -336,6 +336,10 @@ func probeIPObservations(value egress.ProbeResult) []probeIPObservation {
 		add(egress.ProbeFamilyResult{Status: value.Status, TestedAt: value.TestedAt, ExitIP: value.ExitIP}, value.TestedAt)
 	}
 	return observations
+}
+
+func isPublicEgressIP(address netip.Addr) bool {
+	return address.IsGlobalUnicast() && !address.IsPrivate() && !address.IsLoopback() && !address.IsLinkLocalUnicast()
 }
 
 func (r *EgressRepository) ListDueEgressNodes(ctx context.Context, now time.Time, interval time.Duration, limit int) ([]egress.Node, error) {

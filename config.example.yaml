@@ -96,6 +96,13 @@ routing:
   segmentedSelectorMinCandidates: 3000
   segmentedSelectorWindowSize: 64
 
+# [按需启用] Grok Build 账号与实测 Resin IPv4 的租约容量控制。
+# 启用后仅允许经代理确认 IPv4 的 Build 请求；无法确认时不会回退直连。
+egressLease:
+  enabled: false
+  maxAccountsPerIPv4: 3
+  leaseTTL: 30m
+
 audit:
   # [通常不要修改] 审计批量写入参数；bufferSize 的修改需重启生效。
   bufferSize: 16384

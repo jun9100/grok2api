@@ -65,6 +65,7 @@ type Config struct {
 	Batch             BatchConfig             `yaml:"-"`
 	Media             MediaConfig             `yaml:"media"`
 	Routing           RoutingConfig           `yaml:"routing"`
+	EgressLease       EgressLeaseConfig       `yaml:"egressLease"`
 	Audit             AuditConfig             `yaml:"audit"`
 	QualityGuard      QualityGuardConfig      `yaml:"qualityGuard"`
 	ClientKeyDefaults ClientKeyDefaultsConfig `yaml:"clientKeyDefaults"`
@@ -227,6 +228,15 @@ type RoutingConfig struct {
 	ReasoningReplayEnabled      bool     `yaml:"reasoningReplayEnabled"`
 	ReasoningReplayTTL          Duration `yaml:"reasoningReplayTTL"`
 	ReasoningReplayMaxEntries   int      `yaml:"reasoningReplayMaxEntries"`
+}
+
+// EgressLeaseConfig controls the opt-in Build sticky-IP lease path. It is
+// intentionally separate from node accountCapacity, which limits proxy nodes
+// rather than observed public IPv4 addresses.
+type EgressLeaseConfig struct {
+	Enabled            bool     `yaml:"enabled"`
+	MaxAccountsPerIPv4 int      `yaml:"maxAccountsPerIPv4"`
+	LeaseTTL           Duration `yaml:"leaseTTL"`
 }
 
 type AuditConfig struct {
@@ -619,6 +629,9 @@ func (c Config) Validate() error {
 	if c.Routing.StickyTTL.Value() <= 0 || c.Routing.StickyTTL.Value() > maxRoutingTTL || c.Routing.CooldownBase.Value() <= 0 || c.Routing.CooldownMax.Value() < c.Routing.CooldownBase.Value() || c.Routing.CooldownMax.Value() > maxRoutingCooldown || c.Routing.CapacityWait.Value() <= 0 || c.Routing.CapacityWait.Value() > maxRoutingCapacityWait || (c.Routing.MaxAttempts < unlimitedRoutingAttempts || c.Routing.MaxAttempts == 0 || c.Routing.MaxAttempts > maxRoutingAttempts) || (c.Routing.VideoMaxAttempts < unlimitedRoutingAttempts || c.Routing.VideoMaxAttempts > maxRoutingAttempts) {
 		return errors.New("routing 配置无效")
 	}
+	if c.EgressLease.MaxAccountsPerIPv4 < 1 || c.EgressLease.MaxAccountsPerIPv4 > 100000 || c.EgressLease.LeaseTTL.Value() < time.Minute || c.EgressLease.LeaseTTL.Value() > 24*time.Hour {
+		return errors.New("egressLease 配置无效")
+	}
 	if c.Routing.SegmentedMinCandidates < 100 || c.Routing.SegmentedMinCandidates > 1000000 ||
 		c.Routing.SegmentedWindowSize < 8 || c.Routing.SegmentedWindowSize > 256 ||
 		c.Routing.SegmentedWindowSize > c.Routing.SegmentedMinCandidates {
@@ -838,6 +851,7 @@ func defaultConfig() Config {
 			ReasoningReplayTTL:          Duration(time.Hour),
 			ReasoningReplayMaxEntries:   10240,
 		},
+		EgressLease: EgressLeaseConfig{MaxAccountsPerIPv4: 3, LeaseTTL: Duration(30 * time.Minute)},
 		Audit: AuditConfig{
 			BufferSize: 16384, BatchSize: 256, FlushInterval: Duration(250 * time.Millisecond), CommitDelay: Duration(5 * time.Millisecond),
 			LedgerMode: "enforce", LedgerFailureThreshold: 1,

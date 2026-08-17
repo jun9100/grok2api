@@ -785,7 +785,7 @@ func TestEgressOperationsIgnoresUnverifiedExitIPs(t *testing.T) {
 	}
 
 	value.Status = egress.ProbeStatusHealthy
-	value.IPv4.ExitIP = "127.0.0.1"
+	value.IPv4.ExitIP = "10.0.0.1"
 	if err := nodes.UpdateEgressNodeProbe(ctx, node.ID, node.EncryptedProxyURL, value); err != nil {
 		t.Fatal(err)
 	}

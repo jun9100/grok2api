@@ -18,6 +18,8 @@ type EgressRepository interface {
 // EgressIPLeaseRepository is separate from the routing contract while
 // lease-backed Build routing remains behind a feature switch.
 type EgressIPLeaseRepository interface {
+	GetActiveBuildEgressIPLease(context.Context, uint64, time.Time) (egress.IPLease, error)
+	ObserveBuildEgressIPv4(context.Context, uint64, egress.ProbeResult) (uint64, error)
 	AcquireBuildEgressIPLease(context.Context, egress.IPLeaseAcquireInput) (egress.IPLease, bool, error)
 	ReleaseEgressIPLease(context.Context, uint64, string, time.Time) error
 }

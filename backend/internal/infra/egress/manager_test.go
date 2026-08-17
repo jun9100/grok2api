@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptrace"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,6 +23,7 @@ import (
 	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
 	domain "github.com/chenyme/grok2api/backend/internal/domain/egress"
 	settingsdomain "github.com/chenyme/grok2api/backend/internal/domain/settings"
+	"github.com/chenyme/grok2api/backend/internal/infra/persistence/relational"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
 	"github.com/chenyme/grok2api/backend/internal/repository"
 )
@@ -90,6 +92,66 @@ func TestBuildResponseHeaderTimeoutHotUpdateRebuildsCachedClients(t *testing.T) 
 	}
 	if len(observed) != 2 || observed[0] != 5*time.Minute || observed[1] != 7*time.Minute {
 		t.Fatalf("observed timeouts = %v", observed)
+	}
+}
+
+func TestBuildIPLeaseFailsClosedWithoutVerifiedProxy(t *testing.T) {
+	manager := NewManager(egressRepositoryTestStub{}, nil)
+	manager.UpdateBuildIPLeaseConfig(BuildIPLeaseConfig{Enabled: true, MaxAccountsPerIPv4: 3, LeaseTTL: 30 * time.Minute})
+	lease, err := manager.AcquireCredential(context.Background(), domain.ScopeBuild, accountdomain.Credential{ID: 1, Provider: accountdomain.ProviderBuild})
+	if lease != nil || !errors.Is(err, errBuildIPLeaseUnavailable) {
+		t.Fatalf("lease=%#v err=%v", lease, err)
+	}
+}
+
+func TestBuildIPLeaseCreatesAndReusesVerifiedStickyLease(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "egress.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	cipher, err := security.NewCipher("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxyURL, err := cipher.Encrypt("socks5h://Default.{account}:token@resin.example:2260")
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository := relational.NewEgressRepository(database)
+	node, err := repository.CreateEgressNode(ctx, domain.Node{Name: "resin", Scope: domain.ScopeBuild, Enabled: true, EncryptedProxyURL: proxyURL, Health: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := NewManager(repository, cipher)
+	manager.UpdateBuildIPLeaseConfig(BuildIPLeaseConfig{Enabled: true, MaxAccountsPerIPv4: 3, LeaseTTL: 30 * time.Minute})
+	clientCalls := 0
+	manager.newBuildClient = func(_ string, _ time.Duration) (requestClient, error) {
+		clientCalls++
+		return &scriptedRequestClient{do: func(_ int, _ *http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("ip=198.51.100.42\n"))}, nil
+		}}, nil
+	}
+	credential := accountdomain.Credential{ID: 41, Provider: accountdomain.ProviderBuild}
+	first, err := manager.AcquireCredential(ctx, domain.ScopeBuild, credential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.EgressIPLeaseID == 0 || first.ExitIP != "198.51.100.42" || first.NodeID != node.ID || !strings.Contains(first.ProxyURL, "grok_build_41") {
+		t.Fatalf("first lease = %#v", first)
+	}
+	first.Release()
+	second, err := manager.AcquireCredential(ctx, domain.ScopeBuild, credential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Release()
+	if second.EgressIPLeaseID != first.EgressIPLeaseID || second.NodeID != node.ID || clientCalls != 2 {
+		t.Fatalf("second lease = %#v, client calls=%d", second, clientCalls)
 	}
 }
 

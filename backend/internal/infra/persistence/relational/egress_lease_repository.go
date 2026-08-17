@@ -12,6 +12,68 @@ import (
 	"gorm.io/gorm/clause"
 )
 
+func (r *EgressRepository) GetActiveBuildEgressIPLease(ctx context.Context, accountID uint64, now time.Time) (egress.IPLease, error) {
+	if accountID == 0 {
+		return egress.IPLease{}, repository.ErrInvalidEgressIPLease
+	}
+	if now = now.UTC(); now.IsZero() {
+		now = time.Now().UTC()
+	}
+	var row egressIPLeaseModel
+	if err := r.db.db.WithContext(ctx).
+		Where("account_id = ? AND scope = ? AND state = ? AND expires_at > ?", accountID, string(egress.ScopeBuild), string(egress.IPLeaseStateActive), now).
+		Order("expires_at DESC, id DESC").Take(&row).Error; err != nil {
+		return egress.IPLease{}, mapError(err)
+	}
+	return toEgressIPLeaseDomain(row), nil
+}
+
+// ObserveBuildEgressIPv4 records an IPv4 observed through a Build account's
+// rendered sticky proxy URL. It intentionally accepts only a healthy result.
+func (r *EgressRepository) ObserveBuildEgressIPv4(ctx context.Context, nodeID uint64, value egress.ProbeResult) (uint64, error) {
+	if nodeID == 0 || value.Status != egress.ProbeStatusHealthy {
+		return 0, repository.ErrInvalidEgressIPLease
+	}
+	observations := probeIPObservations(value)
+	var observed probeIPObservation
+	found := false
+	for _, candidate := range observations {
+		if candidate.family == "ipv4" {
+			observed, found = candidate, true
+			break
+		}
+	}
+	if !found {
+		return 0, repository.ErrInvalidEgressIPLease
+	}
+
+	var id uint64
+	err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var node egressNodeModel
+		if err := tx.Select("scope").First(&node, nodeID).Error; err != nil {
+			return mapError(err)
+		}
+		if node.Scope != string(egress.ScopeBuild) {
+			return repository.ErrInvalidEgressIPLease
+		}
+		if err := upsertEgressIPObservations(tx, node.Scope, nodeID, value); err != nil {
+			return err
+		}
+		var record egressIPRecordModel
+		if err := tx.Model(&egressIPRecordModel{}).
+			Where("scope = ? AND family = ? AND exit_ip = ?", node.Scope, observed.family, observed.ip).
+			Select("id").Take(&record).Error; err != nil {
+			return mapError(err)
+		}
+		id = record.ID
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return id, nil
+}
+
 // AcquireBuildEgressIPLease returns the account's existing unexpired Build
 // lease when present. Otherwise it atomically reserves one slot on a verified
 // IPv4 record and creates an active lease. The conditional counter update is

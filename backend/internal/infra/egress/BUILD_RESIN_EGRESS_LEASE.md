@@ -2,8 +2,8 @@
 
 状态：进行中。
 
-已完成：出口 IP 只读观测、`egress_ip_records` 持久化、Build IPv4 租约表与原子容量原语。
-尚未完成：Resin sticky 身份探测接入、请求调度开关、IP 风险隔离与管理端展示。
+已完成：出口 IP 只读观测、`egress_ip_records` 持久化、Build IPv4 租约表与原子容量原语、Resin sticky 身份探测及 fail-closed 调度开关。
+尚未完成：IP 风险隔离与管理端展示。
 
 ## 目标
 

@@ -60,11 +60,14 @@ const maxClientVersionEntries = 4096
 var errNodeSnapshotInvalidated = errors.New("egress node snapshot invalidated")
 var errClientCacheInvalidated = errors.New("egress client cache invalidated")
 var errAccountConnectionIsolationDisabled = errors.New("egress account connection isolation disabled")
+var errBuildIPLeaseUnavailable = errors.New("Build 出口 IP 租约不可用")
 
 type Lease struct {
 	NodeID           uint64
 	NodeName         string
 	Scope            domain.Scope
+	EgressIPLeaseID  uint64
+	ExitIP           string
 	ProxyURL         string
 	UserAgent        string
 	CFCookies        string
@@ -144,6 +147,8 @@ type Manager struct {
 	clientMu               sync.RWMutex
 	clearanceMu            sync.Mutex
 	operationsMu           sync.RWMutex
+	buildLeaseMu           sync.RWMutex
+	buildLeaseConfig       BuildIPLeaseConfig
 	clients                map[clientCacheKey]cachedClient
 	inflight               sync.Map
 	nodes                  map[domain.Scope]cachedNodeSnapshot
@@ -191,6 +196,28 @@ type egressStateRepository interface {
 	UpdateEgressNodeClearance(context.Context, uint64, string, string, string, string, time.Time) error
 	UpdateEgressNodeHealth(context.Context, uint64, float64, int, *time.Time, string) error
 	UpdateEgressNodeLastError(context.Context, uint64, string) error
+}
+
+type buildIPLeaseRepository interface {
+	repository.EgressIPLeaseRepository
+}
+
+// BuildIPLeaseConfig is deliberately fail-closed: enabled Build requests must
+// prove their account-specific IPv4 before using an upstream transport.
+type BuildIPLeaseConfig struct {
+	Enabled            bool
+	MaxAccountsPerIPv4 int
+	LeaseTTL           time.Duration
+}
+
+func (value BuildIPLeaseConfig) normalized() BuildIPLeaseConfig {
+	if value.MaxAccountsPerIPv4 < 1 {
+		value.MaxAccountsPerIPv4 = domain.DefaultBuildIPLeaseCapacity
+	}
+	if value.LeaseTTL <= 0 {
+		value.LeaseTTL = 30 * time.Minute
+	}
+	return value
 }
 
 // operationsConfigRepository is optional so lightweight routing repositories
@@ -368,6 +395,23 @@ func (m *Manager) BuildStreamIdleTimeout() time.Duration {
 	return time.Duration(m.buildStreamIdleTimeout.Load())
 }
 
+// UpdateBuildIPLeaseConfig updates only future Build credential acquisitions.
+// Existing in-flight requests keep their already selected transport.
+func (m *Manager) UpdateBuildIPLeaseConfig(value BuildIPLeaseConfig) {
+	value = value.normalized()
+	m.buildLeaseMu.Lock()
+	m.buildLeaseConfig = value
+	m.buildLeaseMu.Unlock()
+	m.log().Info("build_egress_ip_lease_config_updated", "enabled", value.Enabled, "max_accounts_per_ipv4", value.MaxAccountsPerIPv4, "lease_ttl", value.LeaseTTL)
+}
+
+func (m *Manager) buildIPLeaseConfigValue() BuildIPLeaseConfig {
+	m.buildLeaseMu.RLock()
+	value := m.buildLeaseConfig
+	m.buildLeaseMu.RUnlock()
+	return value.normalized()
+}
+
 // UpdateAccountIsolatedConnections toggles per-account upstream connection pools.
 // When enabled, different accounts do not share TCP/HTTP clients so upstream
 // egress load balancers can spread traffic by connection; the same account still
@@ -477,8 +521,93 @@ func (m *Manager) AcquireCredential(ctx context.Context, scope domain.Scope, cre
 	}
 	ctx = WithAccountIdentity(ctx, identity)
 	ctx = WithEgressNode(ctx, credential.EgressNodeID)
+	if scope == domain.ScopeBuild && m.buildIPLeaseConfigValue().Enabled {
+		return m.acquireBuildCredentialWithIPLease(ctx, credential)
+	}
 	lease, _, err := m.acquire(ctx, scope, strconv.FormatUint(credential.ID, 10), true, credential.EncryptedCloudflareCookie, credential.EgressNodeID)
 	return lease, err
+}
+
+func (m *Manager) acquireBuildCredentialWithIPLease(ctx context.Context, credential accountdomain.Credential) (*Lease, error) {
+	leaseRepository, ok := m.repository.(buildIPLeaseRepository)
+	if !ok {
+		return nil, fmt.Errorf("%w: 出口存储不支持租约", errBuildIPLeaseUnavailable)
+	}
+	config := m.buildIPLeaseConfigValue()
+	now := time.Now().UTC()
+	if existing, err := leaseRepository.GetActiveBuildEgressIPLease(ctx, credential.ID, now); err == nil {
+		boundContext := WithEgressNode(ctx, existing.EgressNodeID)
+		lease, _, acquireErr := m.acquire(boundContext, domain.ScopeBuild, strconv.FormatUint(credential.ID, 10), false, credential.EncryptedCloudflareCookie, existing.EgressNodeID)
+		if acquireErr != nil {
+			return nil, fmt.Errorf("%w: 复用租约节点 %d: %v", errBuildIPLeaseUnavailable, existing.EgressNodeID, acquireErr)
+		}
+		if lease == nil || lease.NodeID != existing.EgressNodeID || strings.TrimSpace(lease.ProxyURL) == "" {
+			if lease != nil {
+				lease.Release()
+			}
+			return nil, fmt.Errorf("%w: 租约节点 %d 不可用", errBuildIPLeaseUnavailable, existing.EgressNodeID)
+		}
+		lease.EgressIPLeaseID = existing.ID
+		return lease, nil
+	} else if !errors.Is(err, repository.ErrNotFound) {
+		return nil, fmt.Errorf("%w: 查询账号租约: %v", errBuildIPLeaseUnavailable, err)
+	}
+
+	lease, _, err := m.acquire(ctx, domain.ScopeBuild, strconv.FormatUint(credential.ID, 10), false, credential.EncryptedCloudflareCookie, credential.EgressNodeID)
+	if err != nil {
+		return nil, fmt.Errorf("%w: 获取代理节点: %v", errBuildIPLeaseUnavailable, err)
+	}
+	if lease == nil || strings.TrimSpace(lease.ProxyURL) == "" || lease.NodeID == 0 {
+		if lease != nil {
+			lease.Release()
+		}
+		return nil, fmt.Errorf("%w: 无法验证直连出口 IP", errBuildIPLeaseUnavailable)
+	}
+	probe, err := m.probeBuildLeaseIPv4(ctx, lease)
+	if err != nil {
+		lease.Release()
+		return nil, fmt.Errorf("%w: 探测账号出口 IPv4: %v", errBuildIPLeaseUnavailable, err)
+	}
+	recordID, err := leaseRepository.ObserveBuildEgressIPv4(ctx, lease.NodeID, probe)
+	if err != nil {
+		lease.Release()
+		return nil, fmt.Errorf("%w: 记录账号出口 IPv4: %v", errBuildIPLeaseUnavailable, err)
+	}
+	ipLease, _, err := leaseRepository.AcquireBuildEgressIPLease(ctx, domain.IPLeaseAcquireInput{
+		IPRecordID: recordID, AccountID: credential.ID, EgressNodeID: lease.NodeID,
+		MaxAccounts: config.MaxAccountsPerIPv4, Now: now, ExpiresAt: now.Add(config.LeaseTTL),
+	})
+	if err != nil {
+		lease.Release()
+		return nil, fmt.Errorf("%w: 分配账号出口 IPv4: %v", errBuildIPLeaseUnavailable, err)
+	}
+	lease.EgressIPLeaseID = ipLease.ID
+	lease.ExitIP = probe.IPv4.ExitIP
+	return lease, nil
+}
+
+func (m *Manager) probeBuildLeaseIPv4(ctx context.Context, lease *Lease) (domain.ProbeResult, error) {
+	if lease == nil || lease.NodeID == 0 || strings.TrimSpace(lease.ProxyURL) == "" {
+		return domain.ProbeResult{}, errors.New("代理租约无效")
+	}
+	provider := domain.ProbeProviderCloudflare
+	ipv4Endpoint, _ := probeEndpoints(provider)
+	target := preparedEgressProbe{nodeID: lease.NodeID, nodeName: lease.NodeName, nodeScope: domain.ScopeBuild, proxyURL: lease.ProxyURL}
+	ipv4, err := m.probeEgressEndpoint(ctx, target, provider, "ipv4", ipv4Endpoint)
+	result := domain.ProbeResult{Status: domain.ProbeStatusUnhealthy, TestedAt: time.Now().UTC(), LatencyMS: ipv4.LatencyMS, Provider: provider, IPv4: ipv4}
+	if err != nil || ipv4.Status != domain.ProbeStatusHealthy || strings.TrimSpace(ipv4.ExitIP) == "" {
+		if err == nil {
+			message := strings.TrimSpace(ipv4.Error)
+			if message == "" {
+				message = "IPv4 探测未返回出口地址"
+			}
+			err = errors.New(message)
+		}
+		result.Error = err.Error()
+		return result, err
+	}
+	result.Status, result.ExitIP = domain.ProbeStatusHealthy, ipv4.ExitIP
+	return result, nil
 }
 
 func (m *Manager) AcquireIfConfigured(ctx context.Context, scope domain.Scope, affinity string) (*Lease, bool, error) {

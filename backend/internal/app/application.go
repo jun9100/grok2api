@@ -207,6 +207,7 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 	egressManager.UpdateClearanceConfig(clearanceConfig(cfg))
 	egressManager.UpdateBuildResponseHeaderTimeout(cfg.Provider.Build.ResponseHeaderTimeout.Value())
 	egressManager.UpdateBuildStreamIdleTimeout(cfg.Provider.Build.StreamIdleTimeout.Value())
+	egressManager.UpdateBuildIPLeaseConfig(infraegress.BuildIPLeaseConfig{Enabled: cfg.EgressLease.Enabled, MaxAccountsPerIPv4: cfg.EgressLease.MaxAccountsPerIPv4, LeaseTTL: cfg.EgressLease.LeaseTTL.Value()})
 	cliAdapter := cliprovider.NewAdapter(cliprovider.Config{
 		BaseURL: cfg.Provider.Build.BaseURL, FallbackBaseURL: config.NormalizeBuildFallbackBaseURL(cfg.Provider.Build.FallbackBaseURL),
 		ClientVersion: cfg.Provider.Build.ClientVersion, ClientIdentifier: cfg.Provider.Build.ClientIdentifier,
@@ -392,6 +393,7 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 		})
 		egressManager.UpdateBuildResponseHeaderTimeout(next.Provider.Build.ResponseHeaderTimeout.Value())
 		egressManager.UpdateBuildStreamIdleTimeout(next.Provider.Build.StreamIdleTimeout.Value())
+		egressManager.UpdateBuildIPLeaseConfig(infraegress.BuildIPLeaseConfig{Enabled: next.EgressLease.Enabled, MaxAccountsPerIPv4: next.EgressLease.MaxAccountsPerIPv4, LeaseTTL: next.EgressLease.LeaseTTL.Value()})
 		webAdapter.UpdateConfig(webProviderConfig(next))
 		egressManager.UpdateClearanceConfig(clearanceConfig(next))
 		consoleAdapter.UpdateConfig(consoleProviderConfig(next))
