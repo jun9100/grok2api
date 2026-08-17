@@ -491,6 +491,27 @@ type egressSubscriptionSourceModel struct {
 
 func (egressSubscriptionSourceModel) TableName() string { return "egress_subscription_sources" }
 
+// egressIPRecordModel records verified public IP observations independently of
+// proxy-node identities. Dynamic sticky endpoints can therefore be grouped by
+// their actual egress IP before they are assigned account leases.
+type egressIPRecordModel struct {
+	ID               uint64    `gorm:"primaryKey;autoIncrement"`
+	Scope            string    `gorm:"size:32;not null;uniqueIndex:uidx_egress_ip_records_scope_family_exit_ip,priority:1;index:idx_egress_ip_records_scope_last_seen,priority:1;check:chk_egress_ip_records_scope,scope IN ('grok_build','grok_web','grok_console','grok_web_asset','grok_console_asset')"`
+	Family           string    `gorm:"size:4;not null;uniqueIndex:uidx_egress_ip_records_scope_family_exit_ip,priority:2;check:chk_egress_ip_records_family,family IN ('ipv4','ipv6')"`
+	ExitIP           string    `gorm:"size:64;not null;uniqueIndex:uidx_egress_ip_records_scope_family_exit_ip,priority:3;check:chk_egress_ip_records_exit_ip,length(trim(exit_ip)) BETWEEN 1 AND 64"`
+	FirstSeenAt      time.Time `gorm:"not null"`
+	LastSeenAt       time.Time `gorm:"not null;index:idx_egress_ip_records_scope_last_seen,priority:2"`
+	LastProbeAt      time.Time `gorm:"not null"`
+	LastNodeID       uint64    `gorm:"not null;index:idx_egress_ip_records_node_seen,priority:1"`
+	ObservationCount uint64    `gorm:"not null;default:1;check:chk_egress_ip_records_observation_count,observation_count > 0"`
+	ProbeStatus      string    `gorm:"size:16;not null;check:chk_egress_ip_records_probe_status,probe_status IN ('healthy')"`
+	ProbeProvider    string    `gorm:"size:16;not null;check:chk_egress_ip_records_probe_provider,probe_provider IN ('ipinfo','cloudflare')"`
+	CreatedAt        time.Time `gorm:"not null"`
+	UpdatedAt        time.Time `gorm:"not null"`
+}
+
+func (egressIPRecordModel) TableName() string { return "egress_ip_records" }
+
 type egressNodeModel struct {
 	ID                          uint64  `gorm:"primaryKey;autoIncrement"`
 	Name                        string  `gorm:"size:160;not null;check:chk_egress_nodes_name,length(trim(name)) BETWEEN 1 AND 160"`

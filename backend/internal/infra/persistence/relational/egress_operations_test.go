@@ -720,6 +720,80 @@ func TestEgressOperationsPersistsProbeResult(t *testing.T) {
 	}
 }
 
+func TestEgressOperationsRecordsVerifiedExitIPs(t *testing.T) {
+	ctx := context.Background()
+	database := openTestDatabase(t)
+	nodes := NewEgressRepository(database)
+	cipher := egressOperationsCipher(t)
+	node := createHealthyEgressNode(t, ctx, nodes, cipher, "recorded-ip", 0)
+	probedAt := time.Now().UTC().Truncate(time.Millisecond)
+	value := egress.ProbeResult{
+		Status: egress.ProbeStatusHealthy, TestedAt: probedAt, Provider: egress.ProbeProviderCloudflare,
+		IPv4: egress.ProbeFamilyResult{Status: egress.ProbeStatusHealthy, TestedAt: probedAt, ExitIP: "198.51.100.20"},
+		IPv6: egress.ProbeFamilyResult{Status: egress.ProbeStatusHealthy, TestedAt: probedAt, ExitIP: "2001:db8::20"},
+	}
+	if err := nodes.UpdateEgressNodeProbe(ctx, node.ID, node.EncryptedProxyURL, value); err != nil {
+		t.Fatal(err)
+	}
+
+	var records []egressIPRecordModel
+	if err := database.db.WithContext(ctx).Order("family ASC").Find(&records).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 2 || records[0].Family != "ipv4" || records[0].ExitIP != "198.51.100.20" || records[0].ObservationCount != 1 || records[1].Family != "ipv6" || records[1].ExitIP != "2001:db8::20" {
+		t.Fatalf("created records = %#v", records)
+	}
+
+	value.TestedAt = probedAt.Add(time.Minute)
+	value.IPv4.TestedAt = value.TestedAt
+	value.IPv6.TestedAt = value.TestedAt
+	if err := nodes.UpdateEgressNodeProbe(ctx, node.ID, node.EncryptedProxyURL, value); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.db.WithContext(ctx).Order("family ASC").Find(&records).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 2 || records[0].ObservationCount != 2 || !records[0].LastSeenAt.Equal(value.TestedAt) || records[1].ObservationCount != 2 || !records[1].LastSeenAt.Equal(value.TestedAt) {
+		t.Fatalf("updated records = %#v", records)
+	}
+
+	value.IPv4.ExitIP = "198.51.100.21"
+	if err := nodes.UpdateEgressNodeProbe(ctx, node.ID, node.EncryptedProxyURL, value); err != nil {
+		t.Fatal(err)
+	}
+	if count := tableRowCount(t, database, "egress_ip_records"); count != 3 {
+		t.Fatalf("records after IP rotation = %d, want 3", count)
+	}
+}
+
+func TestEgressOperationsIgnoresUnverifiedExitIPs(t *testing.T) {
+	ctx := context.Background()
+	database := openTestDatabase(t)
+	nodes := NewEgressRepository(database)
+	cipher := egressOperationsCipher(t)
+	node := createHealthyEgressNode(t, ctx, nodes, cipher, "unverified-ip", 0)
+	probedAt := time.Now().UTC().Truncate(time.Millisecond)
+	value := egress.ProbeResult{
+		Status: egress.ProbeStatusUnhealthy, TestedAt: probedAt, Provider: egress.ProbeProviderCloudflare,
+		IPv4: egress.ProbeFamilyResult{Status: egress.ProbeStatusHealthy, TestedAt: probedAt, ExitIP: "198.51.100.30"},
+	}
+	if err := nodes.UpdateEgressNodeProbe(ctx, node.ID, node.EncryptedProxyURL, value); err != nil {
+		t.Fatal(err)
+	}
+	if count := tableRowCount(t, database, "egress_ip_records"); count != 0 {
+		t.Fatalf("unhealthy probe created %d records", count)
+	}
+
+	value.Status = egress.ProbeStatusHealthy
+	value.IPv4.ExitIP = "127.0.0.1"
+	if err := nodes.UpdateEgressNodeProbe(ctx, node.ID, node.EncryptedProxyURL, value); err != nil {
+		t.Fatal(err)
+	}
+	if count := tableRowCount(t, database, "egress_ip_records"); count != 0 {
+		t.Fatalf("non-public IP created %d records", count)
+	}
+}
+
 func TestEgressOperationsDiscardsProbeAfterProxyConfigurationChanges(t *testing.T) {
 	ctx := context.Background()
 	database := openTestDatabase(t)

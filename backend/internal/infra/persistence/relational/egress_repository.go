@@ -3,6 +3,7 @@ package relational
 import (
 	"context"
 	"errors"
+	"net/netip"
 	"strings"
 	"time"
 
@@ -241,23 +242,100 @@ func (r *EgressRepository) UpdateEgressNodeProbe(ctx context.Context, id uint64,
 		updates["cooldown_until"] = gorm.Expr("CASE WHEN "+condition+" THEN NULL ELSE cooldown_until END", egress.LastErrorTransport)
 		updates["last_error"] = gorm.Expr("CASE WHEN "+condition+" THEN ? ELSE last_error END", egress.LastErrorTransport, "")
 	}
-	result := r.db.db.WithContext(ctx).Model(&egressNodeModel{}).
-		Where("id = ? AND encrypted_proxy_url = ?", id, expectedEncryptedProxyURL).
-		Updates(updates)
-	if result.Error != nil {
-		return mapError(result.Error)
-	}
-	if result.RowsAffected == 0 {
-		var count int64
-		if err := r.db.db.WithContext(ctx).Model(&egressNodeModel{}).Where("id = ?", id).Count(&count).Error; err != nil {
+	return r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		result := tx.Model(&egressNodeModel{}).
+			Where("id = ? AND encrypted_proxy_url = ?", id, expectedEncryptedProxyURL).
+			Updates(updates)
+		if result.Error != nil {
+			return mapError(result.Error)
+		}
+		if result.RowsAffected == 0 {
+			var count int64
+			if err := tx.Model(&egressNodeModel{}).Where("id = ?", id).Count(&count).Error; err != nil {
+				return mapError(err)
+			}
+			if count == 0 {
+				return repository.ErrNotFound
+			}
+			return repository.ErrConflict
+		}
+
+		var node egressNodeModel
+		if err := tx.Select("scope").First(&node, id).Error; err != nil {
 			return mapError(err)
 		}
-		if count == 0 {
-			return repository.ErrNotFound
+		return upsertEgressIPObservations(tx, node.Scope, id, value)
+	})
+}
+
+func upsertEgressIPObservations(tx *gorm.DB, scope string, nodeID uint64, value egress.ProbeResult) error {
+	if value.Status != egress.ProbeStatusHealthy {
+		return nil
+	}
+
+	observations := probeIPObservations(value)
+	for _, observation := range observations {
+		if err := tx.Clauses(clause.OnConflict{
+			Columns: []clause.Column{{Name: "scope"}, {Name: "family"}, {Name: "exit_ip"}},
+			DoUpdates: clause.Assignments(map[string]any{
+				"last_seen_at":      observation.testedAt,
+				"last_probe_at":     observation.testedAt,
+				"last_node_id":      nodeID,
+				"observation_count": gorm.Expr("observation_count + ?", 1),
+				"probe_status":      string(egress.ProbeStatusHealthy),
+				"probe_provider":    string(storedProbeProvider(value.Provider)),
+				"updated_at":        time.Now().UTC(),
+			}),
+		}).Create(&egressIPRecordModel{
+			Scope: scope, Family: observation.family, ExitIP: observation.ip,
+			FirstSeenAt: observation.testedAt, LastSeenAt: observation.testedAt, LastProbeAt: observation.testedAt,
+			LastNodeID: nodeID, ObservationCount: 1,
+			ProbeStatus: string(egress.ProbeStatusHealthy), ProbeProvider: string(storedProbeProvider(value.Provider)),
+		}).Error; err != nil {
+			return mapError(err)
 		}
-		return repository.ErrConflict
 	}
 	return nil
+}
+
+type probeIPObservation struct {
+	family   string
+	ip       string
+	testedAt time.Time
+}
+
+func probeIPObservations(value egress.ProbeResult) []probeIPObservation {
+	observations := make([]probeIPObservation, 0, 2)
+	seen := make(map[string]struct{}, 2)
+	add := func(candidate egress.ProbeFamilyResult, fallback time.Time) {
+		if candidate.Status != egress.ProbeStatusHealthy {
+			return
+		}
+		address, err := netip.ParseAddr(strings.TrimSpace(candidate.ExitIP))
+		if err != nil || !address.IsGlobalUnicast() {
+			return
+		}
+		family := "ipv6"
+		if address.Is4() {
+			family = "ipv4"
+		}
+		key := family + ":" + address.String()
+		if _, exists := seen[key]; exists {
+			return
+		}
+		seen[key] = struct{}{}
+		testedAt := candidate.TestedAt.UTC()
+		if testedAt.IsZero() {
+			testedAt = fallback.UTC()
+		}
+		observations = append(observations, probeIPObservation{family: family, ip: address.String(), testedAt: testedAt})
+	}
+	add(value.IPv4, value.TestedAt)
+	add(value.IPv6, value.TestedAt)
+	if len(observations) == 0 {
+		add(egress.ProbeFamilyResult{Status: value.Status, TestedAt: value.TestedAt, ExitIP: value.ExitIP}, value.TestedAt)
+	}
+	return observations
 }
 
 func (r *EgressRepository) ListDueEgressNodes(ctx context.Context, now time.Time, interval time.Duration, limit int) ([]egress.Node, error) {
