@@ -6,12 +6,14 @@ import (
 )
 
 var (
-	ErrNotFound            = errors.New("repository: not found")
-	ErrConflict            = errors.New("repository: conflict")
-	ErrLimitExceeded       = errors.New("repository: limit exceeded")
-	ErrInvalidRecord       = errors.New("repository: invalid record")
-	ErrAccountPoolMismatch = errors.New("repository: account pool mismatch")
-	ErrEgressFallbackInUse = errors.New("repository: egress fallback node in use")
+	ErrNotFound             = errors.New("repository: not found")
+	ErrConflict             = errors.New("repository: conflict")
+	ErrLimitExceeded        = errors.New("repository: limit exceeded")
+	ErrInvalidRecord        = errors.New("repository: invalid record")
+	ErrAccountPoolMismatch  = errors.New("repository: account pool mismatch")
+	ErrEgressFallbackInUse  = errors.New("repository: egress fallback node in use")
+	ErrEgressIPCapacity     = errors.New("repository: egress IP capacity reached")
+	ErrInvalidEgressIPLease = errors.New("repository: invalid egress IP lease")
 )
 
 // InvalidBatchRecordError identifies a deterministic invalid record without

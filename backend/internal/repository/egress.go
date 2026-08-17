@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"time"
 
 	"github.com/chenyme/grok2api/backend/internal/domain/egress"
 )
@@ -12,6 +13,13 @@ type EgressRepository interface {
 	CreateEgressNode(ctx context.Context, value egress.Node) (egress.Node, error)
 	UpdateEgressNode(ctx context.Context, value egress.Node) (egress.Node, error)
 	DeleteEgressNode(ctx context.Context, id uint64) error
+}
+
+// EgressIPLeaseRepository is separate from the routing contract while
+// lease-backed Build routing remains behind a feature switch.
+type EgressIPLeaseRepository interface {
+	AcquireBuildEgressIPLease(context.Context, egress.IPLeaseAcquireInput) (egress.IPLease, bool, error)
+	ReleaseEgressIPLease(context.Context, uint64, string, time.Time) error
 }
 
 // EgressNodePageRepository is the bounded management-list contract. Runtime

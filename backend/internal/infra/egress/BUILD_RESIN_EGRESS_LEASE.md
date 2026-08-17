@@ -1,6 +1,9 @@
 # Grok Build Resin 出口租约方案
 
-状态：提案，尚未实现。
+状态：进行中。
+
+已完成：出口 IP 只读观测、`egress_ip_records` 持久化、Build IPv4 租约表与原子容量原语。
+尚未完成：Resin sticky 身份探测接入、请求调度开关、IP 风险隔离与管理端展示。
 
 ## 目标
 

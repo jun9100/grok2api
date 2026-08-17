@@ -12,6 +12,8 @@ const (
 
 const LastErrorTransport = "transport error"
 
+const DefaultBuildIPLeaseCapacity = 3
+
 type Scope string
 
 const (
@@ -121,6 +123,53 @@ type ProbeFamilyResult struct {
 	LatencyMS int
 	ExitIP    string
 	Error     string
+}
+
+type IPLeaseState string
+
+const (
+	IPLeaseStateActive      IPLeaseState = "active"
+	IPLeaseStateExpired     IPLeaseState = "expired"
+	IPLeaseStateReleased    IPLeaseState = "released"
+	IPLeaseStateQuarantined IPLeaseState = "quarantined"
+)
+
+func (value IPLeaseState) IsValid() bool {
+	switch value {
+	case IPLeaseStateActive, IPLeaseStateExpired, IPLeaseStateReleased, IPLeaseStateQuarantined:
+		return true
+	default:
+		return false
+	}
+}
+
+// IPLease is a durable account-to-verified-egress-IP binding. It deliberately
+// contains no proxy URL or credential material.
+type IPLease struct {
+	ID             uint64
+	IPRecordID     uint64
+	AccountID      uint64
+	Scope          Scope
+	EgressNodeID   uint64
+	State          IPLeaseState
+	AcquiredAt     time.Time
+	RenewedAt      time.Time
+	ExpiresAt      time.Time
+	ReleasedAt     *time.Time
+	LastVerifiedAt *time.Time
+	LastError      string
+	ReleaseReason  string
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
+}
+
+type IPLeaseAcquireInput struct {
+	IPRecordID   uint64
+	AccountID    uint64
+	EgressNodeID uint64
+	MaxAccounts  int
+	Now          time.Time
+	ExpiresAt    time.Time
 }
 
 // SubscriptionSource stores a write-only remote proxy subscription. The URL

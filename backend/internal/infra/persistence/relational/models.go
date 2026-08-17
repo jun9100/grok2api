@@ -503,6 +503,7 @@ type egressIPRecordModel struct {
 	LastSeenAt       time.Time `gorm:"not null;index:idx_egress_ip_records_scope_last_seen,priority:2"`
 	LastProbeAt      time.Time `gorm:"not null"`
 	LastNodeID       uint64    `gorm:"not null;index:idx_egress_ip_records_node_seen,priority:1"`
+	ActiveLeaseCount uint64    `gorm:"not null;default:0;check:chk_egress_ip_records_active_lease_count,active_lease_count >= 0"`
 	ObservationCount uint64    `gorm:"not null;default:1;check:chk_egress_ip_records_observation_count,observation_count > 0"`
 	ProbeStatus      string    `gorm:"size:16;not null;check:chk_egress_ip_records_probe_status,probe_status IN ('healthy')"`
 	ProbeProvider    string    `gorm:"size:16;not null;check:chk_egress_ip_records_probe_provider,probe_provider IN ('ipinfo','cloudflare')"`
@@ -511,6 +512,29 @@ type egressIPRecordModel struct {
 }
 
 func (egressIPRecordModel) TableName() string { return "egress_ip_records" }
+
+// egressIPLeaseModel is a durable account allocation. The active count lives
+// on egressIPRecordModel so capacity can be claimed with one conditional SQL
+// update instead of a racy count-then-insert sequence.
+type egressIPLeaseModel struct {
+	ID             uint64    `gorm:"primaryKey;autoIncrement"`
+	IPRecordID     uint64    `gorm:"not null;index:idx_egress_ip_leases_record_state_expiry,priority:1"`
+	AccountID      uint64    `gorm:"not null;uniqueIndex:uidx_egress_ip_leases_active_account_scope,priority:1,where:state = 'active';index:idx_egress_ip_leases_account_scope,priority:1"`
+	Scope          string    `gorm:"size:32;not null;uniqueIndex:uidx_egress_ip_leases_active_account_scope,priority:2,where:state = 'active';index:idx_egress_ip_leases_account_scope,priority:2;check:chk_egress_ip_leases_scope,scope IN ('grok_build','grok_web','grok_console','grok_web_asset','grok_console_asset')"`
+	EgressNodeID   uint64    `gorm:"not null;default:0"`
+	State          string    `gorm:"size:16;not null;index:idx_egress_ip_leases_record_state_expiry,priority:2;check:chk_egress_ip_leases_state,state IN ('active','expired','released','quarantined')"`
+	AcquiredAt     time.Time `gorm:"not null"`
+	RenewedAt      time.Time `gorm:"not null"`
+	ExpiresAt      time.Time `gorm:"not null;index:idx_egress_ip_leases_record_state_expiry,priority:3"`
+	ReleasedAt     *time.Time
+	LastVerifiedAt *time.Time
+	LastError      string    `gorm:"size:512;not null;default:'';check:chk_egress_ip_leases_last_error,length(last_error) <= 512"`
+	ReleaseReason  string    `gorm:"size:128;not null;default:'';check:chk_egress_ip_leases_release_reason,length(release_reason) <= 128"`
+	CreatedAt      time.Time `gorm:"not null"`
+	UpdatedAt      time.Time `gorm:"not null"`
+}
+
+func (egressIPLeaseModel) TableName() string { return "egress_ip_leases" }
 
 type egressNodeModel struct {
 	ID                          uint64  `gorm:"primaryKey;autoIncrement"`
