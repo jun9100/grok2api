@@ -31,6 +31,7 @@ func TestClassifyQualityHold(t *testing.T) {
 	}{
 		{name: "thinking delivers", sig: QualityStreamSignals{HasThinking: true, VisibleTokens: 10}, want: QualityDeliver},
 		{name: "reasoning tokens deliver", sig: QualityStreamSignals{ReasoningTokens: 40, VisibleTokens: 80, Terminal: true}, want: QualityDeliver},
+		{name: "tool use delivers without thinking", sig: QualityStreamSignals{HasToolUse: true, OutputTokens: 40, Terminal: true}, want: QualityDeliver},
 		{name: "visible 32 no think withhold", sig: QualityStreamSignals{VisibleTokens: 32, Terminal: true}, want: QualityWithhold},
 		{name: "output 40 no think withhold", sig: QualityStreamSignals{OutputTokens: 40, Terminal: true}, want: QualityWithhold},
 		{name: "short no think delivers", sig: QualityStreamSignals{VisibleTokens: 10, Terminal: true}, want: QualityDeliver},
@@ -213,6 +214,24 @@ func TestObserveQualityChunkNoThinkEnoughChat(t *testing.T) {
 	}
 	if ClassifyQualityHold(sig, 32) != QualityWithhold {
 		t.Fatalf("no-think enough should withhold, got %s (%#v)", ClassifyQualityHold(sig, 32), sig)
+	}
+}
+
+func TestObserveQualityChunkNoThinkAnthropicToolUseDelivers(t *testing.T) {
+	t.Parallel()
+	state := qualityScanState{protocol: qualityProtocolAnthropic}
+	ObserveQualityChunk(&state, []byte(sse(
+		`data: {"type":"content_block_start","index":0,"content_block":{"id":"toolu_1","type":"tool_use","name":"Bash","input":{}}}`,
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"test -s review.md\"}"}}`,
+		`data: {"type":"message_delta","usage":{"output_tokens":40,"output_tokens_details":{"thinking_tokens":0}}}`,
+		`data: {"type":"message_stop"}`,
+	)))
+	sig := state.signals()
+	if !sig.HasToolUse || sig.HasThinking || !sig.Terminal {
+		t.Fatalf("tool-use fixture signals = %#v", sig)
+	}
+	if ClassifyQualityHold(sig, 32) != QualityDeliver {
+		t.Fatalf("no-think tool-use should deliver, got %s (%#v)", ClassifyQualityHold(sig, 32), sig)
 	}
 }
 

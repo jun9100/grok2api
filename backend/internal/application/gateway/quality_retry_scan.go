@@ -70,6 +70,7 @@ func (s *qualityScanState) signals() QualityStreamSignals {
 	}
 	return QualityStreamSignals{
 		HasThinking:     s.hasThinking || s.reasoningTokens > 0 || s.usage.ReasoningTokens > 0,
+		HasToolUse:      s.hasOutputToolUse,
 		VisibleTokens:   visible,
 		ReasoningTokens: max(s.reasoningTokens, s.usage.ReasoningTokens),
 		OutputTokens:    output,

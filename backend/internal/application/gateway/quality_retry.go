@@ -30,8 +30,8 @@ const (
 var (
 	errQualityDegraded      = errors.New("上游响应缺少推理")
 	errToolActionUnverified = errors.New("上游工具动作未验证")
-	errAgentContract       = errors.New("Agent 任务契约未满足")
-	errAgentStall          = errors.New("Agent 工具轨迹停滞")
+	errAgentContract        = errors.New("Agent 任务契约未满足")
+	errAgentStall           = errors.New("Agent 工具轨迹停滞")
 )
 
 // QualityRetryRuntime is the isolated request-path withhold/retry policy.
@@ -62,6 +62,7 @@ type QualityRetryRuntime struct {
 // directly and via ObserveQualityChunk on SSE fixtures.
 type QualityStreamSignals struct {
 	HasThinking     bool
+	HasToolUse      bool
 	VisibleTokens   int64
 	ReasoningTokens int64
 	OutputTokens    int64
@@ -129,14 +130,17 @@ func (s *Service) qualityRetryConfig() QualityRetryRuntime {
 }
 
 // ClassifyQualityHold decides whether a held stream may be forwarded.
-// Thinking (or reasoning tokens) always delivers. A finished or expired
-// sample with enough visible output and no reasoning is 降智 and withheld.
-// Short replies below minOutput are delivered so "ok"/"yes" is not retried.
+// Thinking (or reasoning tokens) always delivers. A tool call also delivers:
+// it is executable client work rather than a final answer, and the agent
+// outcome guard separately validates its structured follow-up. A finished or
+// expired text sample with enough visible output and no reasoning is 降智 and
+// withheld. Short replies below minOutput are delivered so "ok"/"yes" is not
+// retried.
 func ClassifyQualityHold(sig QualityStreamSignals, minOutput int64) QualityVerdict {
 	if minOutput <= 0 {
 		minOutput = defaultQualityMinOutput
 	}
-	if sig.HasThinking || sig.ReasoningTokens > 0 {
+	if sig.HasThinking || sig.ReasoningTokens > 0 || sig.HasToolUse {
 		return QualityDeliver
 	}
 	output := sig.OutputTokens
