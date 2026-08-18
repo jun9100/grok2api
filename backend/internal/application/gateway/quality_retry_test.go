@@ -165,6 +165,30 @@ func TestBoundQualityRetryWhenRoutingExhausted(t *testing.T) {
 	}
 }
 
+func TestAgentOutcomeValidationFailureIsNonRetryable(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		code       string
+		validation bool
+		status     int
+	}{
+		{code: ErrorAgentOutcomeUnverified, validation: true, status: http.StatusUnprocessableEntity},
+		{code: ErrorAgentContractUnfulfilled, validation: true, status: http.StatusUnprocessableEntity},
+		{code: ErrorQualityDegraded, validation: false, status: http.StatusServiceUnavailable},
+		{code: ErrorAgentStall, validation: false, status: http.StatusServiceUnavailable},
+	} {
+		t.Run(test.code, func(t *testing.T) {
+			t.Parallel()
+			if got := agentOutcomeValidationFailure(test.code); got != test.validation {
+				t.Fatalf("agentOutcomeValidationFailure(%q) = %t, want %t", test.code, got, test.validation)
+			}
+			if got := qualityFailureHTTPStatus(test.code); got != test.status {
+				t.Fatalf("qualityFailureHTTPStatus(%q) = %d, want %d", test.code, got, test.status)
+			}
+		})
+	}
+}
+
 func sse(frames ...string) string {
 	var b strings.Builder
 	for _, frame := range frames {

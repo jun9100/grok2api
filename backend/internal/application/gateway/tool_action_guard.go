@@ -8,11 +8,10 @@ import (
 
 const maxToolActionTextBytes = 64 << 10
 
-// toolActionRequirement is deliberately narrow. It is enabled only for an
-// Anthropic request that advertises local write tools and asks for a file-like
-// artifact, or that carries an unresolved write failure in its tool history.
-// The gateway cannot inspect the client's filesystem; it verifies only the
-// tool-result evidence the client supplied to this turn.
+// toolActionRequirement carries the legacy Anthropic artifact guard and the
+// protocol-neutral agent outcome contract. The gateway cannot inspect the
+// client's filesystem; it verifies only the typed tool-result evidence the
+// client supplied to this turn.
 type toolActionRequirement struct {
 	Enabled                bool
 	ArtifactRequested      bool
@@ -22,12 +21,26 @@ type toolActionRequirement struct {
 	// usually client-supplied metadata; a prior failed mutation may activate a
 	// narrow implicit mutation-recovery contract. It is intentionally separate
 	// from ArtifactRequested, whose legacy fallback uses user-language hints.
-	ContractOpen               bool
-	RequiresMutation           bool
-	RequiresExecution          bool
-	RequiresVerification       bool
-	VerifiedExecution          bool
-	VerifiedVerification       bool
+	ContractOpen         bool
+	RequiresMutation     bool
+	RequiresExecution    bool
+	RequiresVerification bool
+	VerifiedExecution    bool
+	VerifiedVerification bool
+	// Strict outcome receipts are opt-in through agent_contract. They are not
+	// inferred from normal tool text or an is_error=false envelope.
+	RequiresCommandExitZero         bool
+	RequiresArtifactExists          bool
+	RequiresSVGValid                bool
+	RequiresBrowserAssertionsPassed bool
+	VerifiedCommandExitZero         bool
+	VerifiedArtifactExists          bool
+	VerifiedSVGValid                bool
+	VerifiedBrowserAssertionsPassed bool
+	// RequiredToolReceipts keeps strict receipts tied to individual tool-call
+	// IDs. It prevents one successful write from satisfying another failed one.
+	RequiredToolReceipts       map[string]agentOutcomeReceipt
+	VerifiedToolReceipts       map[string]agentOutcomeReceipt
 	StallSuspected             bool
 	ObservationTurns           int
 	ObservationActions         int
@@ -120,6 +133,7 @@ type anthropicHistoryContentBlock struct {
 	Name      string          `json:"name"`
 	ToolUseID string          `json:"tool_use_id"`
 	Input     json.RawMessage `json:"input"`
+	Content   json.RawMessage `json:"content"`
 	IsError   bool            `json:"is_error"`
 	Text      string          `json:"text"`
 }
@@ -250,6 +264,9 @@ func (r toolActionRequirement) failureCode(state *qualityScanState) string {
 		return ErrorToolActionUnverified
 	}
 	if r.ContractOpen && !r.contractSatisfied() {
+		if !r.outcomeReceiptsSatisfied() || !r.toolReceiptRequirementsSatisfied() {
+			return ErrorAgentOutcomeUnverified
+		}
 		return ErrorAgentContractUnfulfilled
 	}
 	if !r.ArtifactRequested || r.VerifiedWrite {
@@ -271,6 +288,33 @@ func (r toolActionRequirement) contractSatisfied() bool {
 	}
 	if r.RequiresVerification && !r.VerifiedVerification {
 		return false
+	}
+	return r.outcomeReceiptsSatisfied() && r.toolReceiptRequirementsSatisfied()
+}
+
+func (r toolActionRequirement) outcomeReceiptsSatisfied() bool {
+	if r.RequiresCommandExitZero && !r.VerifiedCommandExitZero {
+		return false
+	}
+	if r.RequiresArtifactExists && !r.VerifiedArtifactExists {
+		return false
+	}
+	if r.RequiresSVGValid && !r.VerifiedSVGValid {
+		return false
+	}
+	if r.RequiresBrowserAssertionsPassed && !r.VerifiedBrowserAssertionsPassed {
+		return false
+	}
+	return true
+}
+
+func (r toolActionRequirement) toolReceiptRequirementsSatisfied() bool {
+	for id, required := range r.RequiredToolReceipts {
+		// A multi-bit requirement is fulfilled only when the correlated result
+		// contains every required receipt, not merely one of them.
+		if actual := r.VerifiedToolReceipts[id]; required == 0 || actual&required != required {
+			return false
+		}
 	}
 	return true
 }

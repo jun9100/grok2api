@@ -18,6 +18,7 @@ const (
 	ErrorQualityDegraded          = "quality_degraded"
 	ErrorToolActionUnverified     = "tool_action_unverified"
 	ErrorAgentContractUnfulfilled = "agent_contract_unfulfilled"
+	ErrorAgentOutcomeUnverified   = "agent_outcome_unverified"
 	ErrorAgentStall               = "agent_stall"
 	qualityRetryFailOpen          = "fail_open"
 	qualityRetryFailClosed        = "fail_closed"
@@ -31,6 +32,7 @@ var (
 	errQualityDegraded      = errors.New("上游响应缺少推理")
 	errToolActionUnverified = errors.New("上游工具动作未验证")
 	errAgentContract        = errors.New("Agent 任务契约未满足")
+	errAgentOutcome         = errors.New("Agent 任务结果未验证")
 	errAgentStall           = errors.New("Agent 工具轨迹停滞")
 )
 
@@ -260,6 +262,9 @@ func qualityFailureError(code string) error {
 	if code == ErrorAgentContractUnfulfilled {
 		return errAgentContract
 	}
+	if code == ErrorAgentOutcomeUnverified {
+		return errAgentOutcome
+	}
 	if code == ErrorAgentStall {
 		return errAgentStall
 	}
@@ -269,9 +274,31 @@ func qualityFailureError(code string) error {
 	return errQualityDegraded
 }
 
+// agentOutcomeValidationFailure is a client-visible proof failure, not an
+// upstream availability failure. Retrying the same completed tool history on
+// more accounts cannot make its artifact receipt become valid.
+func agentOutcomeValidationFailure(code string) bool {
+	switch code {
+	case ErrorAgentContractUnfulfilled, ErrorAgentOutcomeUnverified:
+		return true
+	default:
+		return false
+	}
+}
+
+func qualityFailureHTTPStatus(code string) int {
+	if agentOutcomeValidationFailure(code) {
+		return http.StatusUnprocessableEntity
+	}
+	return http.StatusServiceUnavailable
+}
+
 func qualityFailureMessage(code string) string {
 	if code == ErrorAgentContractUnfulfilled {
 		return "Agent 任务契约未满足"
+	}
+	if code == ErrorAgentOutcomeUnverified {
+		return "Agent 任务结果未验证"
 	}
 	if code == ErrorAgentStall {
 		return "Agent 工具轨迹停滞"

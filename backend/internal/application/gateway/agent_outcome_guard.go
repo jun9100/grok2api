@@ -14,13 +14,20 @@ var agentOutcomeContractKeys = []string{"agent_contract", "agentContract", "grok
 // The gateway does not infer a contract from user text or try to prove local
 // filesystem state; clients opt in with request metadata instead.
 type agentOutcomeContract struct {
-	RequiresMutation     bool
-	RequiresExecution    bool
-	RequiresVerification bool
+	RequiresMutation                bool
+	RequiresExecution               bool
+	RequiresVerification            bool
+	RequiresCommandExitZero         bool
+	RequiresArtifactExists          bool
+	RequiresSVGValid                bool
+	RequiresBrowserAssertionsPassed bool
+	ToolReceipts                    map[string]agentOutcomeReceipt
 }
 
 func (c agentOutcomeContract) hasRequirements() bool {
-	return c.RequiresMutation || c.RequiresExecution || c.RequiresVerification
+	return c.RequiresMutation || c.RequiresExecution || c.RequiresVerification ||
+		c.RequiresCommandExitZero || c.RequiresArtifactExists || c.RequiresSVGValid || c.RequiresBrowserAssertionsPassed ||
+		len(c.ToolReceipts) > 0
 }
 
 // agentOutcomeRequirementFromRequest builds the protocol-neutral guard state
@@ -39,6 +46,13 @@ func agentOutcomeRequirementFromRequest(body []byte, protocol string, stallTurns
 		collectResponsesToolLedger(body, &ledger)
 	}
 	ledger.finishObservationTail()
+	if !explicitContract && len(ledger.requiredReceiptsByCall) > 0 {
+		// Some Anthropic relays normalize or drop gateway-private request fields.
+		// A typed outcome envelope inside the correlated tool_result survives that
+		// transport path without relying on natural-language success claims.
+		contract.ToolReceipts = cloneAgentOutcomeReceipts(ledger.requiredReceiptsByCall)
+		explicitContract = true
+	}
 	if !explicitContract {
 		// A failed mutation, command, or verification result is an unambiguous
 		// structured fact, unlike a natural-language request. Keep a recovery
@@ -76,17 +90,27 @@ func agentOutcomeRequirementFromRequest(body []byte, protocol string, stallTurns
 		stallTurns = 6
 	}
 	return toolActionRequirement{
-		Enabled:                    true,
-		ContractOpen:               true,
-		RequiresMutation:           contract.RequiresMutation,
-		RequiresExecution:          contract.RequiresExecution,
-		RequiresVerification:       contract.RequiresVerification,
-		VerifiedWrite:              ledger.verified.has(toolCapabilityMutation),
-		VerifiedExecution:          ledger.verified.has(toolCapabilityExecution),
-		VerifiedVerification:       ledger.verified.has(toolCapabilityVerification),
-		ObservationTurns:           ledger.observationActions,
-		ObservationActions:         ledger.observationActions,
-		RepeatedObservationActions: ledger.observationActions,
+		Enabled:                         true,
+		ContractOpen:                    true,
+		RequiresMutation:                contract.RequiresMutation,
+		RequiresExecution:               contract.RequiresExecution,
+		RequiresVerification:            contract.RequiresVerification,
+		RequiresCommandExitZero:         contract.RequiresCommandExitZero,
+		RequiresArtifactExists:          contract.RequiresArtifactExists,
+		RequiresSVGValid:                contract.RequiresSVGValid,
+		RequiresBrowserAssertionsPassed: contract.RequiresBrowserAssertionsPassed,
+		VerifiedWrite:                   ledger.verified.has(toolCapabilityMutation),
+		VerifiedExecution:               ledger.verified.has(toolCapabilityExecution),
+		VerifiedVerification:            ledger.verified.has(toolCapabilityVerification),
+		VerifiedCommandExitZero:         ledger.receipts.has(agentOutcomeReceiptCommandExitZero),
+		VerifiedArtifactExists:          ledger.receipts.has(agentOutcomeReceiptArtifactExists),
+		VerifiedSVGValid:                ledger.receipts.has(agentOutcomeReceiptSVGValid),
+		VerifiedBrowserAssertionsPassed: ledger.receipts.has(agentOutcomeReceiptBrowserAssertionsPassed),
+		RequiredToolReceipts:            cloneAgentOutcomeReceipts(contract.ToolReceipts),
+		VerifiedToolReceipts:            cloneAgentOutcomeReceipts(ledger.receiptsByCall),
+		ObservationTurns:                ledger.observationActions,
+		ObservationActions:              ledger.observationActions,
+		RepeatedObservationActions:      ledger.observationActions,
 		// The next observation-only tool call is the configured threshold. A
 		// productive call is always allowed through for client execution.
 		StallSuspected: ledger.observationActions >= stallTurns-1,
@@ -205,7 +229,31 @@ func parseAgentOutcomeContract(raw json.RawMessage) (agentOutcomeContract, bool)
 			found = true
 		}
 	}
-	for _, key := range []string{"requires", "required", "outcomes"} {
+	for _, key := range []string{"requires_command_exit_zero", "requiresCommandExitZero", "command_exit_zero", "commandExitZero"} {
+		if value, exists := rawBool(object[key]); exists {
+			contract.RequiresCommandExitZero = contract.RequiresCommandExitZero || value
+			found = true
+		}
+	}
+	for _, key := range []string{"requires_artifact_exists", "requiresArtifactExists", "artifact_exists", "artifactExists"} {
+		if value, exists := rawBool(object[key]); exists {
+			contract.RequiresArtifactExists = contract.RequiresArtifactExists || value
+			found = true
+		}
+	}
+	for _, key := range []string{"requires_svg_valid", "requiresSVGValid", "svg_valid", "svgValid"} {
+		if value, exists := rawBool(object[key]); exists {
+			contract.RequiresSVGValid = contract.RequiresSVGValid || value
+			found = true
+		}
+	}
+	for _, key := range []string{"requires_browser_assertions_passed", "requiresBrowserAssertionsPassed", "browser_assertions_passed", "browserAssertionsPassed"} {
+		if value, exists := rawBool(object[key]); exists {
+			contract.RequiresBrowserAssertionsPassed = contract.RequiresBrowserAssertionsPassed || value
+			found = true
+		}
+	}
+	for _, key := range []string{"requires", "required", "outcomes", "receipts", "required_receipts", "requires_receipts"} {
 		values, exists := rawStringSlice(object[key])
 		if !exists {
 			continue
@@ -219,8 +267,29 @@ func parseAgentOutcomeContract(raw json.RawMessage) (agentOutcomeContract, bool)
 				contract.RequiresExecution = true
 			case "verification":
 				contract.RequiresVerification = true
+			case "command_exit_zero":
+				contract.RequiresCommandExitZero = true
+			case "artifact_exists":
+				contract.RequiresArtifactExists = true
+			case "svg_valid":
+				contract.RequiresSVGValid = true
+			case "browser_assertions_passed":
+				contract.RequiresBrowserAssertionsPassed = true
 			}
 		}
+	}
+	for _, key := range []string{"tool_receipts", "toolReceipts", "receipt_requirements", "receiptRequirements"} {
+		requirements, exists := parseAgentToolReceiptRequirements(object[key])
+		if !exists {
+			continue
+		}
+		if contract.ToolReceipts == nil {
+			contract.ToolReceipts = make(map[string]agentOutcomeReceipt, len(requirements))
+		}
+		for id, receipts := range requirements {
+			contract.ToolReceipts[id] |= receipts
+		}
+		found = true
 	}
 	return contract, found
 }
@@ -233,8 +302,92 @@ func normalizeContractOutcome(value string) string {
 		return "execution"
 	case "verification", "verify", "test", "validate", "check":
 		return "verification"
+	case "commandexitzero", "commandexit0", "exitzero", "exit0":
+		return "command_exit_zero"
+	case "artifactexists", "artifactpresent", "fileexists":
+		return "artifact_exists"
+	case "svgvalid", "svgreferencesvalid", "svgreferenceintegrity":
+		return "svg_valid"
+	case "browserassertionspassed", "browserpassed", "browserverified":
+		return "browser_assertions_passed"
 	default:
 		return ""
+	}
+}
+
+// parseAgentToolReceiptRequirements keeps artifact checks bound to the tool
+// call that produced them. A global artifact_exists bit can prove one file but
+// cannot prove every file in a multi-step task.
+func parseAgentToolReceiptRequirements(raw json.RawMessage) (map[string]agentOutcomeReceipt, bool) {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return nil, false
+	}
+	var entries []json.RawMessage
+	if json.Unmarshal(raw, &entries) != nil {
+		return nil, false
+	}
+	requirements := make(map[string]agentOutcomeReceipt, len(entries))
+	for _, entry := range entries {
+		fields, ok := rawJSONObject(entry)
+		if !ok {
+			continue
+		}
+		id := ""
+		for _, key := range []string{"tool_call_id", "toolCallID", "tool_use_id", "toolUseID", "call_id", "callID", "id"} {
+			if value := rawString(fields[key]); value != "" {
+				id = value
+				break
+			}
+		}
+		if id == "" {
+			continue
+		}
+		if receipts := agentOutcomeReceiptRequirementsFromObject(fields); receipts != 0 {
+			requirements[id] |= receipts
+		}
+	}
+	return requirements, len(requirements) > 0
+}
+
+func agentOutcomeReceiptRequirementsFromObject(fields map[string]json.RawMessage) agentOutcomeReceipt {
+	var requirements agentOutcomeReceipt
+	if rawOutcomeBool(fields, "requires_command_exit_zero", "requiresCommandExitZero", "command_exit_zero", "commandExitZero") {
+		requirements |= agentOutcomeReceiptCommandExitZero
+	}
+	if rawOutcomeBool(fields, "requires_artifact_exists", "requiresArtifactExists", "artifact_exists", "artifactExists") {
+		requirements |= agentOutcomeReceiptArtifactExists
+	}
+	if rawOutcomeBool(fields, "requires_svg_valid", "requiresSVGValid", "svg_valid", "svgValid") {
+		requirements |= agentOutcomeReceiptSVGValid
+	}
+	if rawOutcomeBool(fields, "requires_browser_assertions_passed", "requiresBrowserAssertionsPassed", "browser_assertions_passed", "browserAssertionsPassed") {
+		requirements |= agentOutcomeReceiptBrowserAssertionsPassed
+	}
+	for _, key := range []string{"requires", "required", "outcomes", "receipts", "required_receipts", "requires_receipts"} {
+		values, exists := rawStringSlice(fields[key])
+		if !exists {
+			continue
+		}
+		for _, value := range values {
+			requirements |= agentOutcomeReceiptForContractOutcome(normalizeContractOutcome(value))
+		}
+	}
+	return requirements
+}
+
+func agentOutcomeReceiptForContractOutcome(value string) agentOutcomeReceipt {
+	switch value {
+	case "command_exit_zero":
+		return agentOutcomeReceiptCommandExitZero
+	case "artifact_exists":
+		return agentOutcomeReceiptArtifactExists
+	case "svg_valid":
+		return agentOutcomeReceiptSVGValid
+	case "browser_assertions_passed":
+		return agentOutcomeReceiptBrowserAssertionsPassed
+	default:
+		return 0
 	}
 }
 
@@ -300,6 +453,41 @@ func (c toolCapability) productive() bool {
 	return c&(toolCapabilityMutation|toolCapabilityExecution|toolCapabilityVerification) != 0
 }
 
+// agentOutcomeReceipt is evidence returned by the client-side tool runtime.
+// These bits are intentionally separate from tool capabilities: a completed
+// tool call is not proof that its command, artifact, SVG, or browser check
+// actually succeeded.
+type agentOutcomeReceipt uint8
+
+const (
+	agentOutcomeReceiptCommandExitZero agentOutcomeReceipt = 1 << iota
+	agentOutcomeReceiptArtifactExists
+	agentOutcomeReceiptSVGValid
+	agentOutcomeReceiptBrowserAssertionsPassed
+)
+
+const (
+	embeddedAgentOutcomeReceiptType    = "grok_agent_outcome_receipt"
+	embeddedAgentOutcomeReceiptVersion = int64(1)
+)
+
+func (r agentOutcomeReceipt) has(expected agentOutcomeReceipt) bool {
+	return r&expected != 0
+}
+
+func cloneAgentOutcomeReceipts(source map[string]agentOutcomeReceipt) map[string]agentOutcomeReceipt {
+	if len(source) == 0 {
+		return nil
+	}
+	cloned := make(map[string]agentOutcomeReceipt, len(source))
+	for id, receipts := range source {
+		if id = strings.TrimSpace(id); id != "" && receipts != 0 {
+			cloned[id] = receipts
+		}
+	}
+	return cloned
+}
+
 type agentToolLedgerAction struct {
 	capabilities toolCapability
 	round        int
@@ -311,19 +499,24 @@ type agentToolLedgerRound struct {
 }
 
 type agentToolLedger struct {
-	actions            map[string]agentToolLedgerAction
-	rounds             map[int]*agentToolLedgerRound
-	verified           toolCapability
-	failed             toolCapability
-	observationActions int
-	activeRound        int
-	nextRound          int
+	actions                map[string]agentToolLedgerAction
+	rounds                 map[int]*agentToolLedgerRound
+	verified               toolCapability
+	failed                 toolCapability
+	receipts               agentOutcomeReceipt
+	receiptsByCall         map[string]agentOutcomeReceipt
+	requiredReceiptsByCall map[string]agentOutcomeReceipt
+	observationActions     int
+	activeRound            int
+	nextRound              int
 }
 
 func newAgentToolLedger() agentToolLedger {
 	return agentToolLedger{
-		actions: make(map[string]agentToolLedgerAction),
-		rounds:  make(map[int]*agentToolLedgerRound),
+		actions:                make(map[string]agentToolLedgerAction),
+		rounds:                 make(map[int]*agentToolLedgerRound),
+		receiptsByCall:         make(map[string]agentOutcomeReceipt),
+		requiredReceiptsByCall: make(map[string]agentOutcomeReceipt),
 	}
 }
 
@@ -349,7 +542,7 @@ func (l *agentToolLedger) recordCall(id string, capability toolCapability) {
 	l.actions[id] = agentToolLedgerAction{capabilities: capability, round: l.activeRound}
 }
 
-func (l *agentToolLedger) recordResult(id string, success bool) {
+func (l *agentToolLedger) recordResult(id string, success bool, receipts, requiredReceipts agentOutcomeReceipt) {
 	if l == nil || strings.TrimSpace(id) == "" {
 		return
 	}
@@ -359,6 +552,14 @@ func (l *agentToolLedger) recordResult(id string, success bool) {
 	}
 	if success {
 		l.verified |= action.capabilities
+		l.receipts |= receipts
+		l.receiptsByCall[id] |= receipts
+		// Ordinary successful tool results have no strict receipt requirement.
+		// Do not create an empty map entry: its presence would incorrectly turn
+		// a legacy recovery or observation-only request into a strict contract.
+		if requiredReceipts != 0 {
+			l.requiredReceiptsByCall[id] |= requiredReceipts
+		}
 	} else {
 		l.failed |= action.capabilities
 	}
@@ -412,7 +613,8 @@ func collectAnthropicToolLedger(body []byte, ledger *agentToolLedger) {
 			case "tool_use":
 				ledger.recordCall(block.ID, classifyToolCapability("tool_use", block.Name, block.Input))
 			case "tool_result":
-				ledger.recordResult(block.ToolUseID, !block.IsError)
+				fields := anthropicToolResultFields(block)
+				ledger.recordResult(block.ToolUseID, !block.IsError && structuredToolResultSucceeded(fields), structuredToolResultReceipts(fields), structuredToolResultReceiptRequirements(fields))
 			}
 		}
 	}
@@ -439,7 +641,7 @@ func collectResponsesToolLedger(body []byte, ledger *agentToolLedger) {
 		id := rawToolCallID(fields)
 		switch {
 		case isResponseToolOutput(kind):
-			ledger.recordResult(id, structuredToolResultSucceeded(fields))
+			ledger.recordResult(id, structuredToolResultSucceeded(fields), structuredToolResultReceipts(fields), structuredToolResultReceiptRequirements(fields))
 			lastWasOutput = true
 		case isResponseToolCall(kind):
 			if ledger.activeRound == 0 || lastWasOutput {
@@ -448,7 +650,7 @@ func collectResponsesToolLedger(body []byte, ledger *agentToolLedger) {
 			capability := classifyToolCapability(kind, rawString(fields["name"]), raw)
 			ledger.recordCall(id, capability)
 			if isSelfContainedResponseTool(kind, fields) {
-				ledger.recordResult(id, structuredToolResultSucceeded(fields))
+				ledger.recordResult(id, structuredToolResultSucceeded(fields), structuredToolResultReceipts(fields), structuredToolResultReceiptRequirements(fields))
 				lastWasOutput = true
 			} else {
 				lastWasOutput = false
@@ -490,7 +692,7 @@ func collectChatToolLedger(body []byte, ledger *agentToolLedger) {
 				}
 			}
 		case "tool":
-			ledger.recordResult(rawString(message["tool_call_id"]), structuredToolResultSucceeded(message))
+			ledger.recordResult(rawString(message["tool_call_id"]), structuredToolResultSucceeded(message), structuredToolResultReceipts(message), structuredToolResultReceiptRequirements(message))
 		}
 	}
 }
@@ -502,6 +704,19 @@ func rawToolCallID(fields map[string]json.RawMessage) string {
 		}
 	}
 	return ""
+}
+
+func anthropicToolResultFields(block anthropicHistoryContentBlock) map[string]json.RawMessage {
+	fields := make(map[string]json.RawMessage, 2)
+	if len(block.Content) > 0 {
+		fields["content"] = block.Content
+	}
+	if block.IsError {
+		fields["is_error"] = json.RawMessage("true")
+	} else {
+		fields["is_error"] = json.RawMessage("false")
+	}
+	return fields
 }
 
 func isResponseToolCall(kind string) bool {
@@ -690,6 +905,221 @@ func structuredToolResultSucceeded(fields map[string]json.RawMessage) bool {
 		return false
 	}
 	return !structuredToolResultFailed(value, 0, false)
+}
+
+const maxStructuredToolResultReceiptDepth = 12
+
+// structuredToolResultReceipts extracts only typed facts from a correlated
+// tool result. It deliberately does not search natural-language output for
+// phrases such as "file created" or "tests passed". A client adapter may use
+// either direct fields or the receipt/outcome/result/output/content envelopes.
+func structuredToolResultReceipts(fields map[string]json.RawMessage) agentOutcomeReceipt {
+	return structuredToolResultReceiptObject(fields, 0)
+}
+
+func structuredToolResultReceiptObject(fields map[string]json.RawMessage, depth int) agentOutcomeReceipt {
+	if len(fields) == 0 || depth > maxStructuredToolResultReceiptDepth {
+		return 0
+	}
+
+	var receipts agentOutcomeReceipt
+	if raw, exists := rawOutcomeField(fields, "exit_code", "exitCode"); exists && rawExitCodeZero(raw) {
+		receipts |= agentOutcomeReceiptCommandExitZero
+	}
+	if rawOutcomeBool(fields, "command_exit_zero", "commandExitZero") {
+		receipts |= agentOutcomeReceiptCommandExitZero
+	}
+	if rawOutcomeBool(fields, "artifact_exists", "artifactExists") {
+		receipts |= agentOutcomeReceiptArtifactExists
+	}
+	if raw, exists := rawOutcomeField(fields, "artifact"); exists {
+		if artifact, ok := rawOutcomeObject(raw); ok && rawOutcomeBool(artifact, "exists") {
+			receipts |= agentOutcomeReceiptArtifactExists
+		}
+	}
+	if rawOutcomeBool(fields, "svg_valid", "svgValid") {
+		receipts |= agentOutcomeReceiptSVGValid
+	}
+	if raw, exists := rawOutcomeField(fields, "svg"); exists {
+		if svg, ok := rawOutcomeObject(raw); ok && rawOutcomeBool(svg, "valid") && rawOutcomeBool(svg, "references_valid", "referencesValid") {
+			receipts |= agentOutcomeReceiptSVGValid
+		}
+	}
+	if rawOutcomeBool(fields, "browser_assertions_passed", "browserAssertionsPassed") {
+		receipts |= agentOutcomeReceiptBrowserAssertionsPassed
+	}
+	if raw, exists := rawOutcomeField(fields, "browser"); exists {
+		if browser, ok := rawOutcomeObject(raw); ok && rawOutcomeBool(browser, "assertions_passed", "assertionsPassed", "passed") {
+			receipts |= agentOutcomeReceiptBrowserAssertionsPassed
+		}
+	}
+
+	for _, key := range []string{"receipt", "outcome", "result", "output", "content", "text"} {
+		if raw, exists := rawOutcomeField(fields, key); exists {
+			receipts |= structuredToolResultReceiptValue(raw, depth+1)
+		}
+	}
+	return receipts
+}
+
+func structuredToolResultReceiptValue(raw json.RawMessage, depth int) agentOutcomeReceipt {
+	if depth > maxStructuredToolResultReceiptDepth {
+		return 0
+	}
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return 0
+	}
+
+	var object map[string]json.RawMessage
+	if json.Unmarshal(raw, &object) == nil && object != nil {
+		return structuredToolResultReceiptObject(object, depth+1)
+	}
+	var values []json.RawMessage
+	if json.Unmarshal(raw, &values) == nil {
+		var receipts agentOutcomeReceipt
+		for _, value := range values {
+			receipts |= structuredToolResultReceiptValue(value, depth+1)
+		}
+		return receipts
+	}
+	var encoded string
+	if json.Unmarshal(raw, &encoded) == nil {
+		trimmed := strings.TrimSpace(encoded)
+		if strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[") {
+			return structuredToolResultReceiptValue(json.RawMessage(trimmed), depth+1)
+		}
+	}
+	return 0
+}
+
+// structuredToolResultReceiptRequirements accepts only the adapter's fixed
+// JSON envelope from a correlated tool_result. It never infers a requirement
+// from prose, filenames, or arbitrary JSON fields.
+func structuredToolResultReceiptRequirements(fields map[string]json.RawMessage) agentOutcomeReceipt {
+	return structuredToolResultReceiptRequirementsObject(fields, 0)
+}
+
+func structuredToolResultReceiptRequirementsObject(fields map[string]json.RawMessage, depth int) agentOutcomeReceipt {
+	if len(fields) == 0 || depth > maxStructuredToolResultReceiptDepth {
+		return 0
+	}
+
+	var requirements agentOutcomeReceipt
+	if isEmbeddedAgentOutcomeReceipt(fields) {
+		requirements |= agentOutcomeReceiptRequirementsFromObject(fields)
+	}
+	for _, key := range []string{"receipt", "outcome", "result", "output", "content", "text"} {
+		if raw, exists := rawOutcomeField(fields, key); exists {
+			requirements |= structuredToolResultReceiptRequirementsValue(raw, depth+1)
+		}
+	}
+	return requirements
+}
+
+func structuredToolResultReceiptRequirementsValue(raw json.RawMessage, depth int) agentOutcomeReceipt {
+	if depth > maxStructuredToolResultReceiptDepth {
+		return 0
+	}
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return 0
+	}
+
+	var object map[string]json.RawMessage
+	if json.Unmarshal(raw, &object) == nil && object != nil {
+		return structuredToolResultReceiptRequirementsObject(object, depth+1)
+	}
+	var values []json.RawMessage
+	if json.Unmarshal(raw, &values) == nil {
+		var requirements agentOutcomeReceipt
+		for _, value := range values {
+			requirements |= structuredToolResultReceiptRequirementsValue(value, depth+1)
+		}
+		return requirements
+	}
+	var encoded string
+	if json.Unmarshal(raw, &encoded) == nil {
+		trimmed := strings.TrimSpace(encoded)
+		if strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[") {
+			return structuredToolResultReceiptRequirementsValue(json.RawMessage(trimmed), depth+1)
+		}
+	}
+	return 0
+}
+
+func isEmbeddedAgentOutcomeReceipt(fields map[string]json.RawMessage) bool {
+	if rawString(fields["type"]) != embeddedAgentOutcomeReceiptType {
+		return false
+	}
+	version, ok := rawOutcomeInt(fields["version"])
+	if !ok || version != embeddedAgentOutcomeReceiptVersion {
+		return false
+	}
+	_, hasReceipt := rawOutcomeField(fields, "receipt")
+	return hasReceipt
+}
+
+func rawOutcomeField(fields map[string]json.RawMessage, names ...string) (json.RawMessage, bool) {
+	for key, raw := range fields {
+		normalized := normalizedToolIdentifier(key)
+		for _, name := range names {
+			if normalized == normalizedToolIdentifier(name) {
+				return raw, true
+			}
+		}
+	}
+	return nil, false
+}
+
+func rawOutcomeBool(fields map[string]json.RawMessage, names ...string) bool {
+	raw, exists := rawOutcomeField(fields, names...)
+	if !exists {
+		return false
+	}
+	value, ok := rawBool(raw)
+	return ok && value
+}
+
+func rawOutcomeInt(raw json.RawMessage) (int64, bool) {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 {
+		return 0, false
+	}
+	var value int64
+	if json.Unmarshal(raw, &value) != nil {
+		return 0, false
+	}
+	return value, true
+}
+
+func rawOutcomeObject(raw json.RawMessage) (map[string]json.RawMessage, bool) {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 {
+		return nil, false
+	}
+	var encoded string
+	if json.Unmarshal(raw, &encoded) == nil {
+		raw = []byte(encoded)
+	}
+	return rawJSONObject(raw)
+}
+
+func rawExitCodeZero(raw json.RawMessage) bool {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 {
+		return false
+	}
+	var value int64
+	if json.Unmarshal(raw, &value) == nil {
+		return value == 0
+	}
+	var encoded string
+	if json.Unmarshal(raw, &encoded) != nil {
+		return false
+	}
+	value, err := strconv.ParseInt(strings.TrimSpace(encoded), 10, 64)
+	return err == nil && value == 0
 }
 
 func structuredToolResultFailed(value any, depth int, outcome bool) bool {

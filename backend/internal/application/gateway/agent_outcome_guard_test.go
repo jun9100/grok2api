@@ -9,6 +9,305 @@ import (
 	"time"
 )
 
+func TestAgentOutcomeStrictReceiptsAcrossProtocols(t *testing.T) {
+	t.Parallel()
+	const receipt = `{"receipt":{"exit_code":0,"artifact":{"exists":true},"svg":{"valid":true,"references_valid":true},"browser":{"assertions_passed":true}}}`
+	tests := []struct {
+		name     string
+		protocol string
+		body     []byte
+		fixture  string
+	}{
+		{
+			name:     "Responses",
+			protocol: qualityProtocolResponses,
+			body: []byte(`{
+  "metadata":{"agent_contract":{"requires":["command_exit_zero","artifact_exists","svg_valid","browser_assertions_passed"]}},
+  "input":[
+    {"type":"function_call","call_id":"outcome-1","name":"shell_command","arguments":"{\"command\":\"go test ./...\"}"},
+    {"type":"function_call_output","call_id":"outcome-1","status":"completed","output":` + receipt + `}
+  ]
+}`),
+			fixture: sse(
+				`data: {"type":"response.reasoning_text.delta","delta":"checking result"}`,
+				`data: {"type":"response.output_text.delta","delta":"done"}`,
+				`data: {"type":"response.completed"}`,
+			),
+		},
+		{
+			name:     "Chat",
+			protocol: qualityProtocolChat,
+			body: []byte(`{
+  "metadata":{"agent_contract":{"requires":["command_exit_zero","artifact_exists","svg_valid","browser_assertions_passed"]}},
+  "messages":[
+    {"role":"assistant","tool_calls":[{"id":"outcome-1","type":"function","function":{"name":"shell_command","arguments":"{\"command\":\"go test ./...\"}"}}]},
+    {"role":"tool","tool_call_id":"outcome-1","content":"` + strings.ReplaceAll(receipt, `"`, `\"`) + `"}
+  ]
+}`),
+			fixture: sse(
+				`data: {"choices":[{"delta":{"thinking_content":"checking result"}}]}`,
+				`data: {"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]}`,
+			),
+		},
+		{
+			name:     "Anthropic",
+			protocol: qualityProtocolAnthropic,
+			body: []byte(`{
+  "metadata":{"agent_contract":{"requires":["command_exit_zero","artifact_exists","svg_valid","browser_assertions_passed"]}},
+  "messages":[
+    {"role":"assistant","content":[{"type":"tool_use","id":"outcome-1","name":"Bash","input":{"command":"go test ./..."}}]},
+    {"role":"user","content":[{"type":"tool_result","tool_use_id":"outcome-1","is_error":false,"content":[{"type":"text","text":"` + strings.ReplaceAll(receipt, `"`, `\"`) + `"}]}]}
+  ]
+}`),
+			fixture: sse(
+				`data: {"type":"content_block_start","content_block":{"type":"thinking"}}`,
+				`data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"checking result"}}`,
+				`data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"done"}}`,
+				`data: {"type":"message_stop"}`,
+			),
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			requirement := agentOutcomeRequirementFromRequest(test.body, test.protocol, 6)
+			if !requirement.Enabled || !requirement.VerifiedCommandExitZero || !requirement.VerifiedArtifactExists || !requirement.VerifiedSVGValid || !requirement.VerifiedBrowserAssertionsPassed {
+				t.Fatalf("strict receipt requirement = %#v", requirement)
+			}
+			if !requirement.contractSatisfied() {
+				t.Fatalf("strict receipt contract unexpectedly unfulfilled: %#v", requirement)
+			}
+
+			replay, verdict, code, _, _, err := peekQualityStream(
+				context.Background(),
+				io.NopCloser(strings.NewReader(test.fixture)),
+				test.protocol,
+				QualityRetryRuntime{Enabled: true, AgentOutcomeGuard: true, HoldTimeout: time.Millisecond},
+				requirement,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = replay.Close()
+			if verdict != QualityDeliver || code != "" {
+				t.Fatalf("strict receipt outcome = verdict=%s code=%q", verdict, code)
+			}
+		})
+	}
+}
+
+func TestAgentOutcomeStrictReceiptRejectsPlainFailedAndUnlinkedResults(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "plain tool text is not receipt evidence",
+			body: `{
+  "metadata":{"agent_contract":{"requires":["artifact_exists"]}},
+  "messages":[
+    {"role":"assistant","tool_calls":[{"id":"write-1","type":"function","function":{"name":"Write","arguments":"{}"}}]},
+    {"role":"tool","tool_call_id":"write-1","content":"File written successfully"}
+  ]
+}`,
+		},
+		{
+			name: "unlinked receipt cannot satisfy contract",
+			body: `{
+  "metadata":{"agent_contract":{"requires":["artifact_exists"]}},
+  "messages":[
+    {"role":"assistant","tool_calls":[{"id":"write-1","type":"function","function":{"name":"Write","arguments":"{}"}}]},
+    {"role":"tool","tool_call_id":"other-call","content":"{\"artifact\":{\"exists\":true}}"}
+  ]
+}`,
+		},
+		{
+			name: "nonzero exit code cannot satisfy command receipt",
+			body: `{
+  "metadata":{"agent_contract":{"requires":["command_exit_zero"]}},
+  "messages":[
+    {"role":"assistant","tool_calls":[{"id":"test-1","type":"function","function":{"name":"shell_command","arguments":"{\"command\":\"go test ./...\"}"}}]},
+    {"role":"tool","tool_call_id":"test-1","content":"{\"exit_code\":1}"}
+  ]
+}`,
+		},
+		{
+			name: "SVG receipt requires reference validation",
+			body: `{
+  "metadata":{"agent_contract":{"requires":["svg_valid"]}},
+  "messages":[
+    {"role":"assistant","tool_calls":[{"id":"svg-1","type":"function","function":{"name":"shell_command","arguments":"{\"command\":\"node validate-svg.mjs out.svg\"}"}}]},
+    {"role":"tool","tool_call_id":"svg-1","content":"{\"svg\":{\"valid\":true,\"references_valid\":false}}"}
+  ]
+}`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			requirement := agentOutcomeRequirementFromRequest([]byte(test.body), qualityProtocolChat, 6)
+			if !requirement.Enabled || requirement.contractSatisfied() {
+				t.Fatalf("invalid receipt unexpectedly satisfied contract: %#v", requirement)
+			}
+			replay, verdict, code, _, _, err := peekQualityStream(
+				context.Background(),
+				io.NopCloser(strings.NewReader(sse(
+					`data: {"choices":[{"delta":{"thinking_content":"checking"}}]}`,
+					`data: {"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]}`,
+				))),
+				qualityProtocolChat,
+				QualityRetryRuntime{Enabled: true, AgentOutcomeGuard: true, HoldTimeout: time.Millisecond},
+				requirement,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = replay.Close()
+			if verdict != QualityWithhold || code != ErrorAgentOutcomeUnverified {
+				t.Fatalf("invalid strict receipt = verdict=%s code=%q", verdict, code)
+			}
+		})
+	}
+}
+
+func TestAgentOutcomeEmbeddedReceiptEnvelopeSurvivesMetadataNormalization(t *testing.T) {
+	t.Parallel()
+	const envelope = `{"type":"grok_agent_outcome_receipt","version":1,"requires":["artifact_exists","svg_valid"],"receipt":{"artifact":{"exists":true},"svg":{"valid":true,"references_valid":true}}}`
+	body := func(receipt string) []byte {
+		return []byte(`{
+  "messages":[
+    {"role":"assistant","content":[{"type":"tool_use","id":"toolu_embedded","name":"Write","input":{"file_path":"out.svg"}}]},
+    {"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_embedded","is_error":false,"content":[{"type":"text","text":"` + strings.ReplaceAll(receipt, `"`, `\"`) + `"}]}]}
+  ]
+}`)
+	}
+
+	valid := agentOutcomeRequirementFromRequest(body(envelope), qualityProtocolAnthropic, 6)
+	if !valid.Enabled || !valid.ContractOpen || !valid.contractSatisfied() {
+		t.Fatalf("embedded valid receipt requirement = %#v", valid)
+	}
+	if required := valid.RequiredToolReceipts["toolu_embedded"]; !required.has(agentOutcomeReceiptArtifactExists) || !required.has(agentOutcomeReceiptSVGValid) {
+		t.Fatalf("embedded requirement was not bound to tool call: %#v", valid.RequiredToolReceipts)
+	}
+
+	broken := strings.Replace(envelope, `"references_valid":true`, `"references_valid":false`, 1)
+	invalid := agentOutcomeRequirementFromRequest(body(broken), qualityProtocolAnthropic, 6)
+	if !invalid.Enabled || invalid.contractSatisfied() {
+		t.Fatalf("broken embedded receipt unexpectedly satisfied contract: %#v", invalid)
+	}
+	replay, verdict, code, _, _, err := peekQualityStream(
+		context.Background(),
+		io.NopCloser(strings.NewReader(sse(
+			`data: {"type":"content_block_start","content_block":{"type":"thinking"}}`,
+			`data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"done"}}`,
+			`data: {"type":"message_stop"}`,
+		))),
+		qualityProtocolAnthropic,
+		QualityRetryRuntime{Enabled: true, AgentOutcomeGuard: true, HoldTimeout: time.Millisecond},
+		invalid,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = replay.Close()
+	if verdict != QualityWithhold || code != ErrorAgentOutcomeUnverified {
+		t.Fatalf("broken embedded receipt = verdict=%s code=%q", verdict, code)
+	}
+
+	plain := agentOutcomeRequirementFromRequest(body("grok_agent_outcome_receipt artifact_exists svg_valid"), qualityProtocolAnthropic, 6)
+	if plain.Enabled {
+		t.Fatalf("plain text unexpectedly opened an embedded receipt contract: %#v", plain)
+	}
+}
+
+func TestAgentOutcomeStrictReceiptAllowsActionBeforeResult(t *testing.T) {
+	t.Parallel()
+	requirement := agentOutcomeRequirementFromRequest([]byte(`{
+  "metadata":{"agent_contract":{"requires":["artifact_exists","svg_valid"]}},
+  "messages":[{"role":"user","content":"create the requested SVG"}]
+}`), qualityProtocolAnthropic, 6)
+	if !requirement.Enabled || requirement.contractSatisfied() {
+		t.Fatalf("strict action requirement = %#v", requirement)
+	}
+
+	replay, verdict, code, _, _, err := peekQualityStream(
+		context.Background(),
+		io.NopCloser(strings.NewReader(sse(
+			`data: {"type":"content_block_start","index":0,"content_block":{"id":"toolu_1","type":"tool_use","name":"Bash","input":{}}}`,
+			`data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"node validate-svg.mjs out.svg\"}"}}`,
+			`data: {"type":"message_stop"}`,
+		))),
+		qualityProtocolAnthropic,
+		QualityRetryRuntime{Enabled: true, AgentOutcomeGuard: true, HoldTimeout: time.Millisecond},
+		requirement,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = replay.Close()
+	if verdict != QualityDeliver || code != "" {
+		t.Fatalf("outgoing tool action = verdict=%s code=%q", verdict, code)
+	}
+}
+
+func TestAgentOutcomeToolReceiptsRequireEachBoundCall(t *testing.T) {
+	t.Parallel()
+	body := []byte(`{
+  "metadata":{"agent_contract":{"tool_receipts":[
+    {"tool_call_id":"write-1","requires":["artifact_exists"]},
+    {"tool_call_id":"svg-1","requires":["svg_valid"]}
+  ]}},
+  "messages":[
+    {"role":"assistant","tool_calls":[
+      {"id":"write-1","type":"function","function":{"name":"Write","arguments":"{\"file_path\":\"out.txt\"}"}},
+      {"id":"svg-1","type":"function","function":{"name":"Write","arguments":"{\"file_path\":\"out.svg\"}"}}
+    ]},
+    {"role":"tool","tool_call_id":"write-1","content":"{\"receipt\":{\"artifact\":{\"exists\":true}}}"},
+    {"role":"tool","tool_call_id":"svg-1","content":"{\"receipt\":{\"svg\":{\"valid\":true,\"references_valid\":false}}}"}
+  ]
+}`)
+	requirement := agentOutcomeRequirementFromRequest(body, qualityProtocolChat, 6)
+	if !requirement.Enabled || len(requirement.RequiredToolReceipts) != 2 {
+		t.Fatalf("per-call requirement = %#v", requirement)
+	}
+	if !requirement.VerifiedToolReceipts["write-1"].has(agentOutcomeReceiptArtifactExists) {
+		t.Fatalf("write receipt missing: %#v", requirement.VerifiedToolReceipts)
+	}
+	if requirement.VerifiedToolReceipts["svg-1"].has(agentOutcomeReceiptSVGValid) {
+		t.Fatalf("invalid SVG receipt unexpectedly verified: %#v", requirement.VerifiedToolReceipts)
+	}
+	if requirement.contractSatisfied() {
+		t.Fatalf("one successful artifact must not satisfy all bound receipts: %#v", requirement)
+	}
+
+	replay, verdict, code, _, _, err := peekQualityStream(
+		context.Background(),
+		io.NopCloser(strings.NewReader(sse(
+			`data: {"choices":[{"delta":{"thinking_content":"checking"}}]}`,
+			`data: {"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]}`,
+		))),
+		qualityProtocolChat,
+		QualityRetryRuntime{Enabled: true, AgentOutcomeGuard: true, HoldTimeout: time.Millisecond},
+		requirement,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = replay.Close()
+	if verdict != QualityWithhold || code != ErrorAgentOutcomeUnverified {
+		t.Fatalf("per-call outcome = verdict=%s code=%q", verdict, code)
+	}
+
+	valid := agentOutcomeRequirementFromRequest(
+		[]byte(strings.Replace(string(body), `\"references_valid\":false`, `\"references_valid\":true`, 1)),
+		qualityProtocolChat,
+		6,
+	)
+	if !valid.contractSatisfied() {
+		t.Fatalf("valid per-call receipts unexpectedly unfulfilled: %#v", valid)
+	}
+}
+
 func TestAgentOutcomeRequirementResponsesLedger(t *testing.T) {
 	t.Parallel()
 	body := []byte(`{

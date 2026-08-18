@@ -161,10 +161,20 @@ qualityGuard:
     # Protocol-neutral Agent outcome guard for Claude Messages, OpenAI Chat,
     # and Responses/Codex. It activates only when request metadata carries
     # agent_contract or grok_agent_contract, for example:
-    # {"requires":["mutation","verification"]}
-    # The gateway then verifies structured tool-result status, never final
-    # natural-language claims. A prior failed write/patch also activates a
-    # narrow mutation recovery without client metadata.
+    # {"requires":["mutation","verification","command_exit_zero","artifact_exists"]}
+    # Optional strict receipts are command_exit_zero, artifact_exists,
+    # svg_valid, and browser_assertions_passed. They must be carried in a
+    # JSON tool result correlated to the original tool-call ID, e.g.
+    # {"exit_code":0,"artifact":{"exists":true}}
+    # For multi-artifact tasks, bind every receipt to its own call instead of
+    # using only a global requirement, for example:
+    # {"tool_receipts":[{"tool_call_id":"toolu_1","requires":["artifact_exists","svg_valid"]}]}
+    # Attach the contract to every request in the agent turn, including the
+    # request that returns the tool result, or the final response cannot be
+    # evaluated against its receipt.
+    # The gateway never accepts final natural-language claims as evidence. A
+    # prior failed write/patch also activates a narrow mutation recovery
+    # without client metadata.
     agentOutcomeGuard: false
     agentStallTurns: 6
   # Optional Build-only stream recovery. The service holds the stream until

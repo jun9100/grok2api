@@ -1441,11 +1441,16 @@ attemptLoop:
 				if qualityCode == "" {
 					qualityCode = ErrorQualityDegraded
 				}
+				if agentOutcomeValidationFailure(qualityCode) {
+					// The correlated local receipt is already decisive. Do not spend
+					// additional accounts on an unchanged tool-result history.
+					commit = QualityCommit{Action: QualityActionReject, Audit: true}
+				}
 				if commit.Audit {
 					s.recordQualityDegraded(ctx, auditBase, credential, peekUsage, startedAt, egressTrace, route.Provider, qualityCode)
 					failureAttempts.captureQualityDegraded(credential, responseStartedAt, qualityCode)
 				}
-				if verdict == QualityWithhold {
+				if verdict == QualityWithhold && !agentOutcomeValidationFailure(qualityCode) {
 					if err := s.selector.MarkFailureAfterSuccess(ctx, credential, http.StatusServiceUnavailable, holdCfg.AccountCooldown); err != nil {
 						s.logger.Warn("quality_degraded_health_write_failed", "account_id", credential.ID, "provider", credential.Provider, "error", err)
 					}
@@ -1463,7 +1468,7 @@ attemptLoop:
 					qualityErr := qualityFailureError(qualityCode)
 					lastErr = qualityErr
 					lastFailure = &UpstreamFailure{
-						HTTPStatus: http.StatusServiceUnavailable, Code: qualityCode,
+						HTTPStatus: qualityFailureHTTPStatus(qualityCode), Code: qualityCode,
 						PublicMessage: qualityFailureMessage(qualityCode), AccountID: credential.ID, AccountName: credential.Name,
 						Cause: qualityErr,
 					}
@@ -1477,7 +1482,7 @@ attemptLoop:
 					qualityErr := qualityFailureError(qualityCode)
 					lastErr = qualityErr
 					lastFailure = &UpstreamFailure{
-						HTTPStatus: http.StatusServiceUnavailable, Code: qualityCode,
+						HTTPStatus: qualityFailureHTTPStatus(qualityCode), Code: qualityCode,
 						PublicMessage: qualityFailureMessage(qualityCode), AccountID: credential.ID, AccountName: credential.Name,
 						Cause: qualityErr,
 					}
