@@ -32,6 +32,11 @@ type toolActionRequirement struct {
 	ObservationTurns           int
 	ObservationActions         int
 	RepeatedObservationActions int
+	// RejectEmptyTerminal is a narrow protocol-level fallback for clients that
+	// cannot attach an explicit outcome contract. It only applies after a
+	// completed observation-only tool tail and rejects a terminal response that
+	// contains neither visible text nor another tool call.
+	RejectEmptyTerminal bool
 }
 
 type toolActionHistoryAction struct {
@@ -227,6 +232,9 @@ func containsToolActionAny(value string, candidates ...string) bool {
 func (r toolActionRequirement) failureCode(state *qualityScanState) string {
 	if !r.Enabled || state == nil || !state.terminal {
 		return ""
+	}
+	if r.RejectEmptyTerminal && !state.terminalFailure && !state.hasOutputToolUse && state.visibleRunes == 0 {
+		return ErrorAgentStall
 	}
 	if state.hasOutputToolUse {
 		// A productive tool call must remain visible so the client can execute

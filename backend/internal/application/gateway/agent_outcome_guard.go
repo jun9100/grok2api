@@ -43,10 +43,23 @@ func agentOutcomeRequirementFromRequest(body []byte, protocol string, stallTurns
 		// A failed Write/Edit/Patch is an unambiguous structured fact, unlike a
 		// natural-language request. Retry only this narrow case even when the
 		// client cannot yet supply an explicit contract.
-		if !ledger.failed.has(toolCapabilityMutation) {
+		if ledger.failed.has(toolCapabilityMutation) {
+			contract.RequiresMutation = true
+		} else if ledger.observationActions >= implicitEmptyTerminalObservationThreshold(stallTurns) {
+			// Native agent clients such as Claude Code cannot attach a per-turn
+			// outcome contract. A terminal response with no text and no next tool
+			// call after multiple completed observations is still an unambiguous
+			// stalled trajectory, independent of user-language intent.
+			return toolActionRequirement{
+				Enabled:                    true,
+				RejectEmptyTerminal:        true,
+				ObservationTurns:           ledger.observationActions,
+				ObservationActions:         ledger.observationActions,
+				RepeatedObservationActions: ledger.observationActions,
+			}
+		} else {
 			return toolActionRequirement{}
 		}
-		contract.RequiresMutation = true
 	}
 	if !contract.hasRequirements() {
 		return toolActionRequirement{}
@@ -71,6 +84,15 @@ func agentOutcomeRequirementFromRequest(body []byte, protocol string, stallTurns
 		// productive call is always allowed through for client execution.
 		StallSuspected: ledger.observationActions >= stallTurns-1,
 	}
+}
+
+func implicitEmptyTerminalObservationThreshold(stallTurns int) int {
+	if stallTurns <= 0 {
+		stallTurns = 6
+	}
+	// Keep the fallback conservative even when a caller configures a smaller
+	// stall threshold. One read followed by a normal answer is common.
+	return max(2, stallTurns-1)
 }
 
 func agentOutcomeContractFromRequest(body []byte) (agentOutcomeContract, bool) {

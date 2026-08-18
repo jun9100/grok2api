@@ -249,6 +249,72 @@ func TestAgentOutcomeGuardLeavesRequestsWithoutContractUntouched(t *testing.T) {
 	}
 }
 
+func TestAgentOutcomeGuardRejectsEmptyTerminalAfterImplicitObservationTail(t *testing.T) {
+	t.Parallel()
+	body := []byte(`{
+  "messages":[
+    {"role":"assistant","content":[{"type":"tool_use","id":"read-1","name":"Read","input":{"file_path":"a.txt"}}]},
+    {"role":"user","content":[{"type":"tool_result","tool_use_id":"read-1","is_error":false,"content":"ok"}]},
+    {"role":"assistant","content":[{"type":"tool_use","id":"read-2","name":"Read","input":{"file_path":"b.txt"}}]},
+    {"role":"user","content":[{"type":"tool_result","tool_use_id":"read-2","is_error":false,"content":"ok"}]}
+  ]
+}`)
+	requirement := agentOutcomeRequirementFromRequest(body, qualityProtocolAnthropic, 3)
+	if !requirement.Enabled || !requirement.RejectEmptyTerminal || requirement.ObservationActions != 2 {
+		t.Fatalf("implicit empty-terminal requirement = %#v", requirement)
+	}
+
+	replay, verdict, code, _, _, err := peekQualityStream(
+		context.Background(),
+		io.NopCloser(strings.NewReader(sse(
+			`data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking"}}`,
+			`data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"checking"}}`,
+			`data: {"type":"message_stop"}`,
+		))),
+		qualityProtocolAnthropic,
+		QualityRetryRuntime{Enabled: true, AgentOutcomeGuard: true, HoldTimeout: time.Millisecond, AgentStallTurns: 3},
+		requirement,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = replay.Close()
+	if verdict != QualityWithhold || code != ErrorAgentStall {
+		t.Fatalf("empty terminal = verdict=%s code=%q", verdict, code)
+	}
+}
+
+func TestAgentOutcomeGuardAllowsVisibleTerminalAfterImplicitObservationTail(t *testing.T) {
+	t.Parallel()
+	body := []byte(`{
+  "messages":[
+    {"role":"assistant","content":[{"type":"tool_use","id":"read-1","name":"Read","input":{"file_path":"a.txt"}}]},
+    {"role":"user","content":[{"type":"tool_result","tool_use_id":"read-1","is_error":false,"content":"ok"}]},
+    {"role":"assistant","content":[{"type":"tool_use","id":"read-2","name":"Read","input":{"file_path":"b.txt"}}]},
+    {"role":"user","content":[{"type":"tool_result","tool_use_id":"read-2","is_error":false,"content":"ok"}]}
+  ]
+}`)
+	requirement := agentOutcomeRequirementFromRequest(body, qualityProtocolAnthropic, 3)
+	replay, verdict, code, _, _, err := peekQualityStream(
+		context.Background(),
+		io.NopCloser(strings.NewReader(sse(
+			`data: {"type":"content_block_start","index":0,"content_block":{"type":"text"}}`,
+			`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Review complete."}}`,
+			`data: {"type":"message_stop"}`,
+		))),
+		qualityProtocolAnthropic,
+		QualityRetryRuntime{Enabled: true, AgentOutcomeGuard: true, HoldTimeout: time.Millisecond, AgentStallTurns: 3},
+		requirement,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = replay.Close()
+	if verdict != QualityDeliver || code != "" {
+		t.Fatalf("visible terminal = verdict=%s code=%q", verdict, code)
+	}
+}
+
 func TestObserveQualityResponsesMarksCodexToolCapabilities(t *testing.T) {
 	t.Parallel()
 	state := qualityScanState{protocol: qualityProtocolResponses}
