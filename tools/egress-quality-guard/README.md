@@ -20,8 +20,8 @@ your own traffic before allowing automatic quarantine.
 
 ## How it works
 
-1. Passive mode polls recent successful streaming audits and computes the same
-   speed shown by the grok2api panel: `output / generation window`.
+1. Passive mode polls recent streaming audits. Successful streams compute the
+   same speed shown by the grok2api panel: `output / generation window`.
    `output` includes reasoning tokens. The window is `duration - first token`,
    except when that tail is both shorter than the first-token wait and under
    1s: then the full duration is used so buffered thinking is not assigned to
@@ -58,11 +58,14 @@ credential, account-block, and quota signals retain their normal transitions.
 - `active`: run only fixed per-node probes at the configured interval.
 - `hybrid`: enable both detectors. This is the recommended default.
 
-Passive monitoring ignores non-streaming requests, failed requests, responses
-with fewer than 32 output tokens, and audits created by the guard's own client
-key. On first startup it records a baseline without replaying historical
-anomalies. Cursor pagination and a persistent bounded ID set prevent duplicate
-processing across polls and restarts.
+Passive monitoring ignores non-streaming requests, ordinary failed requests,
+responses with fewer than 32 output tokens, and audits created by the guard's
+own client key. A Build stream that ends before its first model output is the
+only failed-request exception: it records account/IP correlation evidence after
+the gateway retries on another observed IP, but never quarantines a Resin node.
+On first startup it records a baseline without replaying historical anomalies.
+Cursor pagination and a persistent bounded ID set prevent duplicate processing
+across polls and restarts.
 
 Generic IP/Cloudflare probes are intentionally not recovery gates: some
 residential exits can reach Grok normally while a probe endpoint is blocked.
@@ -196,7 +199,7 @@ API remains available.
 
 - HTTPS/SSE audits cannot provide reliable proxy transfer-byte counts. The UI reports active-probe output Tokens and does not label them as network traffic.
 - Intermediary buffering can produce unusually high instantaneous Token/s, so thresholds require calibration for each route.
-- Passive monitoring processes only complete successful streaming requests with enough output to calculate speed. Short and failed requests are ignored.
+- Passive monitoring processes complete successful streaming requests with enough output to calculate speed. Short and ordinary failed requests are ignored; Build zero-output interruptions are retained as observe-only account/IP evidence.
 - A real request may legitimately return cached content, an existing file, or a long constant. Passive soft and hard anomalies therefore isolate immediately and hold the node until a controlled recovery probe succeeds; raise the thresholds when false positives are more costly.
 - Missing-thinking detection applies only to controlled probe profiles that explicitly require thinking. Arbitrary user traffic may legitimately use a non-reasoning model or disable reasoning and is never isolated solely because `reasoningTokens` is zero.
 - The first run establishes an audit baseline. Cumulative statistics also begin when this version first writes state.

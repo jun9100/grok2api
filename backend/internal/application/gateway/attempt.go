@@ -171,6 +171,52 @@ func (r *failureAttemptRecorder) captureStreamFailure(credential accountdomain.C
 	})
 }
 
+// captureZeroTokenStreamFailure records a read failure discovered while the
+// gateway is still holding the stream. No downstream response bytes exist at
+// this point, so a later retry can safely replace this attempt.
+func (r *failureAttemptRecorder) captureZeroTokenStreamFailure(credential accountdomain.Credential, startedAt time.Time, response *provider.Response, err error) {
+	if response == nil || err == nil {
+		return
+	}
+	statusCode := response.StatusCode
+	r.append(audit.Attempt{
+		Source:             audit.AttemptSourceUpstreamHTTP,
+		Stage:              "response_stream_preflight",
+		AccountID:          auditAccountID(credential.ID),
+		AccountName:        credential.Name,
+		Method:             r.method,
+		RequestPath:        r.path,
+		UpstreamURL:        sanitizeUpstreamURL(response.UpstreamURL),
+		StartedAt:          startedAt.UTC(),
+		DurationMS:         time.Since(startedAt).Milliseconds(),
+		UpstreamStatusCode: &statusCode,
+		UpstreamStatus:     response.Status,
+		ResponseHeaders:    sanitizeDiagnosticHeaders(response.Header),
+		TransportError:     sanitizeDiagnosticText(err.Error(), diagnosticTextLimit),
+		ErrorChain:         errorFrames(err),
+	})
+}
+
+func (r *failureAttemptRecorder) captureQualityDegraded(credential accountdomain.Credential, startedAt time.Time, errorCode string) {
+	if errorCode == "" {
+		errorCode = ErrorQualityDegraded
+	}
+	status := http.StatusOK
+	r.append(audit.Attempt{
+		Source:             audit.AttemptSourceUpstreamHTTP,
+		Stage:              "quality_hold",
+		AccountID:          auditAccountID(credential.ID),
+		AccountName:        credential.Name,
+		Method:             r.method,
+		RequestPath:        r.path,
+		StartedAt:          startedAt.UTC(),
+		DurationMS:         time.Since(startedAt).Milliseconds(),
+		UpstreamStatusCode: &status,
+		UpstreamStatus:     "200 OK",
+		TransportError:     errorCode,
+	})
+}
+
 func (r *failureAttemptRecorder) append(attempt audit.Attempt) {
 	attempt.Number = len(r.attempts) + 1
 	r.attempts = append(r.attempts, attempt)

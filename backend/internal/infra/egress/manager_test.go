@@ -104,6 +104,19 @@ func TestBuildIPLeaseFailsClosedWithoutVerifiedProxy(t *testing.T) {
 	}
 }
 
+func TestAcquireBuildCredentialIfLeaseEnabledUsesContextCredential(t *testing.T) {
+	manager := NewManager(egressRepositoryTestStub{}, nil)
+	manager.UpdateBuildIPLeaseConfig(BuildIPLeaseConfig{Enabled: true, MaxAccountsPerIPv4: 3, LeaseTTL: 30 * time.Minute})
+	ctx := WithCredential(context.Background(), accountdomain.Credential{ID: 1, Provider: accountdomain.ProviderBuild})
+	lease, configured, err := manager.AcquireBuildCredentialIfLeaseEnabled(ctx)
+	if lease != nil || !configured || !errors.Is(err, errBuildIPLeaseUnavailable) {
+		t.Fatalf("lease=%#v configured=%v err=%v", lease, configured, err)
+	}
+	if lease, configured, err := manager.AcquireBuildCredentialIfLeaseEnabled(context.Background()); lease != nil || configured || err != nil {
+		t.Fatalf("accountless lease=%#v configured=%v err=%v", lease, configured, err)
+	}
+}
+
 func TestBuildIPLeaseCreatesAndReusesVerifiedStickyLease(t *testing.T) {
 	ctx := context.Background()
 	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "egress.db"))
@@ -150,8 +163,168 @@ func TestBuildIPLeaseCreatesAndReusesVerifiedStickyLease(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer second.Release()
-	if second.EgressIPLeaseID != first.EgressIPLeaseID || second.NodeID != node.ID || clientCalls != 2 {
+	if second.EgressIPLeaseID != first.EgressIPLeaseID || second.ExitIP != "198.51.100.42" || second.NodeID != node.ID || clientCalls != 2 {
 		t.Fatalf("second lease = %#v, client calls=%d", second, clientCalls)
+	}
+}
+
+func TestBuildIPLeaseRejectsRequestExcludedIPRecord(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "egress-excluded.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	cipher, err := security.NewCipher("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxyURL, err := cipher.Encrypt("socks5h://Default.{account}:token@resin.example:2260")
+	if err != nil {
+		t.Fatal(err)
+	}
+	egressRepository := relational.NewEgressRepository(database)
+	if _, err := egressRepository.CreateEgressNode(ctx, domain.Node{Name: "resin", Scope: domain.ScopeBuild, Enabled: true, EncryptedProxyURL: proxyURL, Health: 1}); err != nil {
+		t.Fatal(err)
+	}
+	manager := NewManager(egressRepository, cipher)
+	manager.UpdateBuildIPLeaseConfig(BuildIPLeaseConfig{Enabled: true, MaxAccountsPerIPv4: 3, LeaseTTL: 30 * time.Minute})
+	manager.newBuildClient = func(_ string, _ time.Duration) (requestClient, error) {
+		return &scriptedRequestClient{do: func(_ int, _ *http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("ip=198.51.100.42\n"))}, nil
+		}}, nil
+	}
+	firstCredential := accountdomain.Credential{ID: 41, Provider: accountdomain.ProviderBuild}
+	first, err := manager.AcquireCredential(ctx, domain.ScopeBuild, firstCredential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.Release()
+	if first.EgressIPRecordID == 0 {
+		t.Fatalf("first lease lacks IP record: %#v", first)
+	}
+
+	excludedCtx := WithExcludedBuildEgressIPRecord(ctx, first.EgressIPRecordID)
+	if lease, acquireErr := manager.AcquireCredential(excludedCtx, domain.ScopeBuild, firstCredential); lease != nil || !errors.Is(acquireErr, ErrBuildEgressIPExcluded) {
+		if lease != nil {
+			lease.Release()
+		}
+		t.Fatalf("existing excluded lease=%#v err=%v", lease, acquireErr)
+	}
+	if lease, acquireErr := manager.AcquireCredential(excludedCtx, domain.ScopeBuild, accountdomain.Credential{ID: 42, Provider: accountdomain.ProviderBuild}); lease != nil || !errors.Is(acquireErr, ErrBuildEgressIPExcluded) {
+		if lease != nil {
+			lease.Release()
+		}
+		t.Fatalf("new excluded lease=%#v err=%v", lease, acquireErr)
+	}
+	if _, lookupErr := egressRepository.GetActiveBuildEgressIPLease(ctx, 42, time.Now().UTC()); !errors.Is(lookupErr, repository.ErrNotFound) {
+		t.Fatalf("excluded account retained a lease: %v", lookupErr)
+	}
+}
+
+func TestBuildIPLeaseRevalidatesChangedStickyExitIP(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "egress.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	cipher, err := security.NewCipher("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxyURL, err := cipher.Encrypt("socks5h://Default.{account}:token@resin.example:2260")
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository := relational.NewEgressRepository(database)
+	node, err := repository.CreateEgressNode(ctx, domain.Node{Name: "resin", Scope: domain.ScopeBuild, Enabled: true, EncryptedProxyURL: proxyURL, Health: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := NewManager(repository, cipher)
+	manager.UpdateBuildIPLeaseConfig(BuildIPLeaseConfig{Enabled: true, MaxAccountsPerIPv4: 3, LeaseTTL: 30 * time.Minute, VerifyInterval: time.Nanosecond})
+	observed := []string{"198.51.100.42", "198.51.100.43"}
+	probeCalls := 0
+	manager.newBuildClient = func(_ string, _ time.Duration) (requestClient, error) {
+		return &scriptedRequestClient{do: func(_ int, _ *http.Request) (*http.Response, error) {
+			value := observed[probeCalls]
+			probeCalls++
+			return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("ip=" + value + "\n"))}, nil
+		}}, nil
+	}
+	credential := accountdomain.Credential{ID: 41, Provider: accountdomain.ProviderBuild}
+	first, err := manager.AcquireCredential(ctx, domain.ScopeBuild, credential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.Release()
+	second, err := manager.AcquireCredential(ctx, domain.ScopeBuild, credential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Release()
+	if probeCalls != 2 || second.NodeID != node.ID || second.ExitIP != "198.51.100.43" || second.EgressIPLeaseID == first.EgressIPLeaseID {
+		t.Fatalf("first=%#v second=%#v probe_calls=%d", first, second, probeCalls)
+	}
+	active, err := repository.GetActiveBuildEgressIPLease(ctx, credential.ID, time.Now().UTC())
+	if err != nil || active.ID != second.EgressIPLeaseID || active.ExitIP != "198.51.100.43" {
+		t.Fatalf("active=%#v err=%v", active, err)
+	}
+}
+
+func TestBuildIPLeaseRevalidationFailureReleasesLease(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "egress.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	cipher, err := security.NewCipher("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxyURL, err := cipher.Encrypt("socks5h://Default.{account}:token@resin.example:2260")
+	if err != nil {
+		t.Fatal(err)
+	}
+	egressRepository := relational.NewEgressRepository(database)
+	if _, err := egressRepository.CreateEgressNode(ctx, domain.Node{Name: "resin", Scope: domain.ScopeBuild, Enabled: true, EncryptedProxyURL: proxyURL, Health: 1}); err != nil {
+		t.Fatal(err)
+	}
+	manager := NewManager(egressRepository, cipher)
+	manager.UpdateBuildIPLeaseConfig(BuildIPLeaseConfig{Enabled: true, MaxAccountsPerIPv4: 3, LeaseTTL: 30 * time.Minute, VerifyInterval: time.Nanosecond})
+	probeCalls := 0
+	manager.newBuildClient = func(_ string, _ time.Duration) (requestClient, error) {
+		return &scriptedRequestClient{do: func(_ int, _ *http.Request) (*http.Response, error) {
+			probeCalls++
+			body := "ip=198.51.100.42\n"
+			if probeCalls > 1 {
+				body = "missing public IP\n"
+			}
+			return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}, nil
+		}}, nil
+	}
+	credential := accountdomain.Credential{ID: 42, Provider: accountdomain.ProviderBuild}
+	first, err := manager.AcquireCredential(ctx, domain.ScopeBuild, credential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.Release()
+	if _, err := manager.AcquireCredential(ctx, domain.ScopeBuild, credential); !errors.Is(err, errBuildIPLeaseUnavailable) {
+		t.Fatalf("revalidation error = %v", err)
+	}
+	if _, err := egressRepository.GetActiveBuildEgressIPLease(ctx, credential.ID, time.Now().UTC()); !errors.Is(err, repository.ErrNotFound) {
+		t.Fatalf("active lease after failed revalidation = %v", err)
 	}
 }
 

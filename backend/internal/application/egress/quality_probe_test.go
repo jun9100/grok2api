@@ -34,12 +34,20 @@ func (r *qualityProbeRepository) ListEgressNodePage(context.Context, repository.
 type qualityProberStub struct {
 	nodeID uint64
 	input  QualityProbeInput
+	result QualityProbeResult
 }
 
 func (p *qualityProberStub) ProbeEgressQuality(_ context.Context, nodeID uint64, input QualityProbeInput) (QualityProbeResult, error) {
 	p.nodeID = nodeID
 	p.input = input
-	return QualityProbeResult{NodeID: nodeID, ExpectedMatched: true}, nil
+	result := p.result
+	if result.NodeID == 0 {
+		result.NodeID = nodeID
+	}
+	if !result.ExpectedMatched {
+		result.ExpectedMatched = true
+	}
+	return result, nil
 }
 
 func TestProbeQualityNormalizesDefaultsAndAllowsDisabledNode(t *testing.T) {
@@ -98,5 +106,25 @@ func TestProbeQualityScopesThinkingGuardToReasoningBuildModels(t *testing.T) {
 	}
 	if prober.input.RequireThinking || result.ThinkingRequired {
 		t.Fatalf("non-reasoning model probe=%#v result=%#v", prober.input, result)
+	}
+}
+
+func TestProbeQualityPreservesBuildEgressAttribution(t *testing.T) {
+	repository := &qualityProbeRepository{node: domain.Node{
+		ID: 7, Scope: domain.ScopeBuild, Enabled: true, EncryptedProxyURL: "encrypted",
+	}}
+	prober := &qualityProberStub{result: QualityProbeResult{
+		RequestID: "probe-request", AttributionAvailable: true, AccountID: 41,
+		EgressIPLeaseID: 51, EgressIPRecordID: 61, BuildBotFlagSource: 2,
+	}}
+	service := NewService(repository, nil, "")
+	service.SetQualityProber(prober)
+
+	result, err := service.ProbeQuality(context.Background(), 7, QualityProbeInput{ClientKeyID: 3, Model: "grok-4.5"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.AttributionAvailable || result.AccountID != 41 || result.EgressIPLeaseID != 51 || result.EgressIPRecordID != 61 || result.BuildBotFlagSource != 2 {
+		t.Fatalf("attribution result = %#v", result)
 	}
 }

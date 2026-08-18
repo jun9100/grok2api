@@ -51,6 +51,11 @@ type QualityProbeResult struct {
 	RequestID             string
 	NodeID                uint64
 	Model                 string
+	AttributionAvailable  bool
+	AccountID             uint64
+	EgressIPLeaseID       uint64
+	EgressIPRecordID      uint64
+	BuildBotFlagSource    int
 	StatusCode            int
 	FirstTokenMS          int64
 	DurationMS            int64
@@ -101,6 +106,10 @@ type ListFilter struct {
 type ServiceRepository interface {
 	repository.EgressRepository
 	repository.EgressNodePageRepository
+}
+
+type buildRiskSummaryRepository interface {
+	repository.BuildEgressRiskSummaryRepository
 }
 
 type Service struct {
@@ -290,6 +299,19 @@ func (s *Service) ListAll(ctx context.Context, scope domain.Scope, sort reposito
 		return nil, err
 	}
 	return s.publicNodes(values), nil
+}
+
+// BuildRiskSummary exposes only aggregate Build/IP evidence for operators.
+// It never changes routing, account state, or IP availability.
+func (s *Service) BuildRiskSummary(ctx context.Context, window time.Duration, limit int) ([]domain.BuildEgressRiskSummary, error) {
+	if window < time.Minute || window > 24*time.Hour || limit < 1 || limit > 500 {
+		return nil, ErrInvalidInput
+	}
+	value, ok := s.repository.(buildRiskSummaryRepository)
+	if !ok {
+		return nil, fmt.Errorf("Build 出口风险汇总不可用")
+	}
+	return value.ListBuildEgressRiskSummaries(ctx, time.Now().UTC().Add(-window), limit)
 }
 
 func (s *Service) publicNodes(values []domain.Node) []domain.PublicNode {

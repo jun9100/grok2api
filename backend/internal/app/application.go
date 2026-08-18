@@ -207,7 +207,7 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 	egressManager.UpdateClearanceConfig(clearanceConfig(cfg))
 	egressManager.UpdateBuildResponseHeaderTimeout(cfg.Provider.Build.ResponseHeaderTimeout.Value())
 	egressManager.UpdateBuildStreamIdleTimeout(cfg.Provider.Build.StreamIdleTimeout.Value())
-	egressManager.UpdateBuildIPLeaseConfig(infraegress.BuildIPLeaseConfig{Enabled: cfg.EgressLease.Enabled, MaxAccountsPerIPv4: cfg.EgressLease.MaxAccountsPerIPv4, LeaseTTL: cfg.EgressLease.LeaseTTL.Value()})
+	egressManager.UpdateBuildIPLeaseConfig(infraegress.BuildIPLeaseConfig{Enabled: cfg.EgressLease.Enabled, MaxAccountsPerIPv4: cfg.EgressLease.MaxAccountsPerIPv4, LeaseTTL: cfg.EgressLease.LeaseTTL.Value(), VerifyInterval: cfg.EgressLease.VerifyInterval.Value()})
 	cliAdapter := cliprovider.NewAdapter(cliprovider.Config{
 		BaseURL: cfg.Provider.Build.BaseURL, FallbackBaseURL: config.NormalizeBuildFallbackBaseURL(cfg.Provider.Build.FallbackBaseURL),
 		ClientVersion: cfg.Provider.Build.ClientVersion, ClientIdentifier: cfg.Provider.Build.ClientIdentifier,
@@ -352,6 +352,8 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 	modelRepo.SetInvalidationObserver(invalidationService.Notify)
 	clientKeyRepo.SetInvalidationObserver(invalidationService.Notify)
 	gatewayService := gateway.NewService(modelService, auditService, accountService, clientKeyService, providers, selector, responseRepo, cfg.Routing.MaxAttempts)
+	gatewayService.UpdateQualityRetry(qualityRetryRuntime(cfg.QualityGuard.RequestRetry))
+	gatewayService.UpdateZeroTokenRetry(zeroTokenRetryRuntime(cfg.QualityGuard.ZeroTokenRetry))
 	gatewayService.UpdateVideoMaxAttempts(cfg.Routing.VideoMaxAttempts)
 	gatewayService.UpdateMarkBuildChatDeniedAsReauth(cfg.Routing.MarkBuildChatDeniedAsReauth)
 	gatewayService.SetLogger(logger)
@@ -393,7 +395,7 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 		})
 		egressManager.UpdateBuildResponseHeaderTimeout(next.Provider.Build.ResponseHeaderTimeout.Value())
 		egressManager.UpdateBuildStreamIdleTimeout(next.Provider.Build.StreamIdleTimeout.Value())
-		egressManager.UpdateBuildIPLeaseConfig(infraegress.BuildIPLeaseConfig{Enabled: next.EgressLease.Enabled, MaxAccountsPerIPv4: next.EgressLease.MaxAccountsPerIPv4, LeaseTTL: next.EgressLease.LeaseTTL.Value()})
+		egressManager.UpdateBuildIPLeaseConfig(infraegress.BuildIPLeaseConfig{Enabled: next.EgressLease.Enabled, MaxAccountsPerIPv4: next.EgressLease.MaxAccountsPerIPv4, LeaseTTL: next.EgressLease.LeaseTTL.Value(), VerifyInterval: next.EgressLease.VerifyInterval.Value()})
 		webAdapter.UpdateConfig(webProviderConfig(next))
 		egressManager.UpdateClearanceConfig(clearanceConfig(next))
 		consoleAdapter.UpdateConfig(consoleProviderConfig(next))
@@ -408,6 +410,8 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 		egressManager.UpdateAccountIsolatedConnections(next.Routing.AccountIsolatedConnections)
 		reasoningReplay.UpdateConfig(reasoningreplay.Config{Enabled: next.Routing.ReasoningReplayEnabled, TTL: next.Routing.ReasoningReplayTTL.Value()})
 		gatewayService.UpdateMaxAttempts(next.Routing.MaxAttempts)
+		gatewayService.UpdateQualityRetry(qualityRetryRuntime(next.QualityGuard.RequestRetry))
+		gatewayService.UpdateZeroTokenRetry(zeroTokenRetryRuntime(next.QualityGuard.ZeroTokenRetry))
 		gatewayService.UpdateVideoMaxAttempts(next.Routing.VideoMaxAttempts)
 		gatewayService.UpdateMarkBuildChatDeniedAsReauth(next.Routing.MarkBuildChatDeniedAsReauth)
 		gatewayService.UpdateBuildForbiddenReauthPolicy(next.Accounts.MarkBuildForbiddenReauth, next.Accounts.BuildForbiddenReauthCodes)
@@ -484,6 +488,27 @@ func accountAutoCleanConfig(value config.AccountsConfig) accountapp.AutoCleanCon
 		Interval:        value.AutoCleanReauthInterval.Value(),
 		MinAge:          value.AutoCleanReauthMinAge.Value(),
 		IncludeDisabled: value.AutoCleanIncludeDisabled,
+	}
+}
+
+func qualityRetryRuntime(value config.QualityGuardRequestRetryConfig) gateway.QualityRetryRuntime {
+	return gateway.QualityRetryRuntime{
+		Enabled:           value.Enabled,
+		MaxAttempts:       value.MaxAttempts,
+		HoldTimeout:       value.HoldTimeout.Value(),
+		MinOutputTokens:   int64(value.MinOutputTokens),
+		AccountCooldown:   value.AccountCooldown.Value(),
+		OnExhausted:       value.OnExhausted,
+		ToolActionGuard:   value.ToolActionGuard,
+		AgentOutcomeGuard: value.AgentOutcomeGuard,
+		AgentStallTurns:   value.AgentStallTurns,
+	}
+}
+
+func zeroTokenRetryRuntime(value config.QualityGuardZeroTokenRetryConfig) gateway.ZeroTokenRetryRuntime {
+	return gateway.ZeroTokenRetryRuntime{
+		Enabled:     value.Enabled,
+		MaxAttempts: value.MaxAttempts,
 	}
 }
 

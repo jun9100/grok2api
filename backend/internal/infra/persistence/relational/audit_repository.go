@@ -114,6 +114,12 @@ func validatePreparedAudit(value preparedAudit) error {
 	if row.EgressNodeID != nil && *row.EgressNodeID == 0 {
 		return errors.New("egress_node_id must be positive when present")
 	}
+	if row.EgressIPRecordID != nil && *row.EgressIPRecordID == 0 {
+		return errors.New("egress_ip_record_id must be positive when present")
+	}
+	if row.BuildBotFlagSource < 0 || row.BuildBotFlagSource > 2 {
+		return errors.New("build_bot_flag_source must be between 0 and 2")
+	}
 	if !auditStringAllowed(row.EgressScope, "", "grok_build", "grok_web", "grok_console", "grok_web_asset", "grok_console_asset") {
 		return errors.New("egress_scope is invalid")
 	}
@@ -352,7 +358,7 @@ func toAuditModels(value audit.Record) (requestAuditModel, []requestAuditAttempt
 		ModelRouteID: value.ModelRouteID, ModelPublicID: truncate(value.ModelPublicID, 255), ModelUpstreamModel: truncate(value.ModelUpstreamModel, 255),
 		Provider: truncate(provider, 32), Operation: string(operation), UsageSource: string(usageSource),
 		AccountID: value.AccountID, AccountName: truncate(value.AccountName, 160),
-		EgressNodeID: value.EgressNodeID, EgressNodeName: truncate(value.EgressNodeName, 160), EgressScope: truncate(value.EgressScope, 32), EgressMode: string(value.EgressMode),
+		EgressNodeID: value.EgressNodeID, EgressIPRecordID: value.EgressIPRecordID, EgressNodeName: truncate(value.EgressNodeName, 160), EgressScope: truncate(value.EgressScope, 32), EgressMode: string(value.EgressMode), BuildBotFlagSource: value.BuildBotFlagSource,
 		StatusCode: value.StatusCode, Streaming: value.Streaming,
 		MediaInputImages: nonNegative(value.MediaInputImages), MediaOutputImages: nonNegative(value.MediaOutputImages), MediaOutputSeconds: nonNegative(value.MediaOutputSeconds),
 		InputTokens: nonNegative(value.InputTokens), CachedInputTokens: nonNegative(value.CachedInputTokens), OutputTokens: nonNegative(value.OutputTokens),

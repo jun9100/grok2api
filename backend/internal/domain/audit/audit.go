@@ -85,9 +85,11 @@ type Record struct {
 	AccountID               *uint64
 	AccountName             string
 	EgressNodeID            *uint64
+	EgressIPRecordID        *uint64
 	EgressNodeName          string
 	EgressScope             string
 	EgressMode              EgressMode
+	BuildBotFlagSource      int
 	StatusCode              int
 	Streaming               bool
 	MediaInputImages        int64

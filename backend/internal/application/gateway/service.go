@@ -205,6 +205,8 @@ type Service struct {
 	modelSyncMu                 sync.Mutex
 	modelSyncing                map[uint64]struct{}
 	markBuildChatDeniedAsReauth atomic.Bool
+	qualityRetry                atomic.Pointer[QualityRetryRuntime]
+	zeroTokenRetry              atomic.Pointer[ZeroTokenRetryRuntime]
 }
 
 type teamModelRateLimit struct {
@@ -453,7 +455,9 @@ func (s *Service) UpdateMaxAttempts(maxAttempts int) { s.maxAttempts.Store(int64
 
 // UpdateVideoMaxAttempts configures create-phase account failover for video jobs.
 // 0 is treated as the general default pool size for legacy configs.
-func (s *Service) UpdateVideoMaxAttempts(maxAttempts int) { s.videoMaxAttempts.Store(int64(maxAttempts)) }
+func (s *Service) UpdateVideoMaxAttempts(maxAttempts int) {
+	s.videoMaxAttempts.Store(int64(maxAttempts))
+}
 
 // UpdateMarkBuildChatDeniedAsReauth 热更新 Build chat 永久拒绝是否标 reauthRequired。
 // 默认 false：仅模型级冷却；true 时按旧逻辑将账号标为失效并出池。
@@ -994,6 +998,15 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	excluded := make(map[uint64]bool)
 	failureFingerprints := make(map[string]int)
 	authRecoveryAttempted := make(map[uint64]bool)
+	// Per-request withhold counter (stack local, not a Service field).
+	// Last withhold is attemptIndex == maxAttempts-1.
+	qualityAttemptIndex := 0
+	zeroTokenCfg := s.zeroTokenRetryConfig()
+	zeroTokenRetries := 0
+	zeroTokenRetryFinalAttempt := -1
+	zeroTokenExcludedEgressIPRecordID := uint64(0)
+	qualityExcludedEgressIPRecordID := uint64(0)
+	egressSelectionSkips := 0
 	quotaMode := s.providers.QuotaMode(route.Provider, route.UpstreamModel)
 	quotaProbeAttempted := false
 	selection := preselectedSession
@@ -1001,11 +1014,22 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	var lastFailure *UpstreamFailure
 	failureAttempts := newFailureAttemptRecorder(http.MethodPost, path)
 	responseStartedAt := startedAt
+	upstreamBody := input.Body
+	if route.Provider == accountdomain.ProviderBuild {
+		upstreamBody = stripAgentOutcomeMetadata(input.Body)
+	}
 	forwardResponse := func(lease *accountLease, credential accountdomain.Credential, billing *accountdomain.Billing) (*provider.Response, error) {
 		started := time.Now()
 		responseStartedAt = started
 		lease.markSelectorUpstreamStarted()
-		response, err := adapter.ForwardResponse(physicalCallCtx, provider.ResponseResourceRequest{Credential: credential, ForcedEgressNodeID: input.ForcedEgressNodeID, Billing: billing, Method: http.MethodPost, Path: path, Model: route.UpstreamModel, PromptCacheKey: input.PromptCacheKey, ReasoningReplayKey: reasoningReplayKey, AllowClientToolCacheRoute: input.AllowClientToolCacheRoute, GrokTurnIndex: input.GrokTurnIndex, IdempotencyID: idempotencyID, Body: input.Body, Streaming: input.Streaming, NormalizeBody: true, Operation: string(operation)})
+		requestCallCtx := physicalCallCtx
+		if zeroTokenExcludedEgressIPRecordID != 0 {
+			requestCallCtx = infraegress.WithExcludedBuildEgressIPRecord(requestCallCtx, zeroTokenExcludedEgressIPRecordID)
+		}
+		if qualityExcludedEgressIPRecordID != 0 {
+			requestCallCtx = infraegress.WithExcludedBuildEgressIPRecord(requestCallCtx, qualityExcludedEgressIPRecordID)
+		}
+		response, err := adapter.ForwardResponse(requestCallCtx, provider.ResponseResourceRequest{Credential: credential, ForcedEgressNodeID: input.ForcedEgressNodeID, Billing: billing, Method: http.MethodPost, Path: path, Model: route.UpstreamModel, PromptCacheKey: input.PromptCacheKey, ReasoningReplayKey: reasoningReplayKey, AllowClientToolCacheRoute: input.AllowClientToolCacheRoute, GrokTurnIndex: input.GrokTurnIndex, IdempotencyID: idempotencyID, Body: upstreamBody, Streaming: input.Streaming, NormalizeBody: true, Operation: string(operation)})
 		err = failureAttempts.captureResponse(credential, started, response, err)
 		timing.markUpstream(time.Since(started))
 		return response, err
@@ -1018,7 +1042,7 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 		return result, err
 	}
 attemptLoop:
-	for attempt := 0; attemptPolicy.allows(attempt); attempt++ {
+	for attempt := 0; attemptPolicy.allows(attempt) && (zeroTokenRetryFinalAttempt < 0 || attempt <= zeroTokenRetryFinalAttempt); attempt++ {
 		var lease *accountLease
 		var err error
 		selectionStarted := time.Now()
@@ -1084,6 +1108,16 @@ attemptLoop:
 		}
 		response, err := forwardResponse(lease, credential, lease.Billing)
 		if err != nil {
+			if errors.Is(err, infraegress.ErrBuildEgressIPExcluded) && (zeroTokenRetryFinalAttempt == attempt || qualityAttemptIndex > 0) {
+				lease.Release()
+				egressSelectionSkips++
+				if egressSelectionSkips <= maxZeroTokenEgressSelectionSkips {
+					attempt--
+					continue
+				}
+				s.logger.Warn("build_egress_retry_exhausted", "request_id", input.RequestID, "zero_token_excluded_egress_ip_record_id", zeroTokenExcludedEgressIPRecordID, "quality_excluded_egress_ip_record_id", qualityExcludedEgressIPRecordID, "selection_skips", egressSelectionSkips)
+				break attemptLoop
+			}
 			lease.Release()
 			lastErr = err
 			if ctx.Err() != nil || errors.Is(err, context.Canceled) {
@@ -1336,7 +1370,128 @@ attemptLoop:
 			continue
 		}
 		if response.StatusCode >= 200 && response.StatusCode < 300 {
+			if shouldHoldZeroTokenStream(input, ownership, route, operation, zeroTokenCfg) {
+				replay, peekErr := peekZeroTokenStream(ctx, response.Body, qualityProtocolForOperation(operation))
+				if peekErr != nil {
+					if replay != nil {
+						_ = replay.Close()
+					} else {
+						_ = response.Body.Close()
+					}
+					lastErr = peekErr
+					if ctx.Err() != nil || errors.Is(peekErr, context.Canceled) {
+						lease.completeSelectorObservation(false)
+						lease.Release()
+						lastFailure = &UpstreamFailure{HTTPStatus: 499, Code: "request_canceled", PublicMessage: "请求已取消", AccountID: credential.ID, AccountName: credential.Name, Cause: firstError(ctx.Err(), peekErr)}
+						break attemptLoop
+					}
+					lastFailure = newZeroTokenStreamFailure(peekErr, credential.ID, credential.Name)
+					failureAttempts.captureZeroTokenStreamFailure(credential, responseStartedAt, response, peekErr)
+					if err := s.selector.MarkFailureAfterSuccess(ctx, credential, 0, 0); err != nil {
+						s.logger.Warn("zero_token_stream_failure_health_write_failed", "account_id", credential.ID, "provider", credential.Provider, "error", err)
+					}
+					egressSelection, traced := egressTrace.Selection(primaryEgressScope(route.Provider))
+					canRetry := zeroTokenRetries+1 < zeroTokenCfg.MaxAttempts && zeroTokenRetryFinalAttempt < 0 && isRetryableZeroTokenStreamFailure(ctx, peekErr) && traced && egressSelection.EgressIPRecordID != 0
+					lease.completeSelectorObservation(false)
+					lease.Release()
+					if !canRetry {
+						if traced && egressSelection.EgressIPRecordID == 0 {
+							s.logger.Warn("zero_token_stream_retry_unattributed", "request_id", input.RequestID, "account_id", credential.ID)
+						}
+						break attemptLoop
+					}
+					s.recordZeroTokenStreamFailure(ctx, auditBase, credential, response.StatusCode, lastFailure, failureAttempts.snapshot(), startedAt, egressTrace, route.Provider)
+					zeroTokenRetries++
+					zeroTokenRetryFinalAttempt = attempt + 1
+					zeroTokenExcludedEgressIPRecordID = egressSelection.EgressIPRecordID
+					s.logger.Info("zero_token_stream_retry", "request_id", input.RequestID, "account_id", credential.ID, "excluded_egress_ip_record_id", zeroTokenExcludedEgressIPRecordID, "retry", zeroTokenRetries)
+					continue
+				}
+				response.Body = replay
+			}
 			s.selector.markSuccess(ctx, credential, lease.QuotaProbe)
+			holdCfg := s.qualityRetryConfig()
+			toolAction := toolActionRequirement{}
+			if holdCfg.AgentOutcomeGuard {
+				toolAction = agentOutcomeRequirementFromRequest(input.Body, qualityProtocolForOperation(operation), holdCfg.AgentStallTurns)
+			}
+			if !toolAction.Enabled && holdCfg.ToolActionGuard {
+				toolAction = toolActionRequirementFromRequest(input.Body)
+			}
+			if shouldHoldQualityStream(input, ownership, route, operation, holdCfg) || shouldHoldToolActionStream(input, ownership, route, operation, holdCfg, toolAction) {
+				replay, verdict, qualityCode, peekUsage, _, peekErr := peekQualityStream(ctx, response.Body, qualityProtocolForOperation(operation), holdCfg, toolAction)
+				if peekErr != nil {
+					if replay != nil {
+						_ = replay.Close()
+					} else {
+						_ = response.Body.Close()
+					}
+					lease.Release()
+					lastErr = peekErr
+					if ctx.Err() != nil || errors.Is(peekErr, context.Canceled) {
+						lastFailure = &UpstreamFailure{HTTPStatus: 499, Code: "request_canceled", PublicMessage: "请求已取消", AccountID: credential.ID, AccountName: credential.Name, Cause: firstError(ctx.Err(), peekErr)}
+						break
+					}
+					lastFailure = newTransportUpstreamFailure(peekErr, credential.ID, credential.Name)
+					continue
+				}
+				response.Body = replay
+				hasNextAttempt := attemptPolicy.hasNext(attempt) && (zeroTokenRetryFinalAttempt < 0 || attempt < zeroTokenRetryFinalAttempt)
+				commit := CommitQualityHold(verdict, qualityAttemptIndex, holdCfg.MaxAttempts, hasNextAttempt, holdCfg.OnExhausted)
+				if qualityCode == "" {
+					qualityCode = ErrorQualityDegraded
+				}
+				if commit.Audit {
+					s.recordQualityDegraded(ctx, auditBase, credential, peekUsage, startedAt, egressTrace, route.Provider, qualityCode)
+					failureAttempts.captureQualityDegraded(credential, responseStartedAt, qualityCode)
+				}
+				if verdict == QualityWithhold {
+					if err := s.selector.MarkFailureAfterSuccess(ctx, credential, http.StatusServiceUnavailable, holdCfg.AccountCooldown); err != nil {
+						s.logger.Warn("quality_degraded_health_write_failed", "account_id", credential.ID, "provider", credential.Provider, "error", err)
+					}
+					if selection, traced := egressTrace.Selection(primaryEgressScope(route.Provider)); traced && selection.EgressIPRecordID != 0 {
+						qualityExcludedEgressIPRecordID = selection.EgressIPRecordID
+					} else if route.Provider == accountdomain.ProviderBuild {
+						s.logger.Warn("quality_degraded_unattributed", "request_id", input.RequestID, "account_id", credential.ID)
+					}
+				}
+				switch commit.Action {
+				case QualityActionRetry:
+					_ = response.Body.Close()
+					lease.completeSelectorObservation(false)
+					lease.Release()
+					qualityErr := qualityFailureError(qualityCode)
+					lastErr = qualityErr
+					lastFailure = &UpstreamFailure{
+						HTTPStatus: http.StatusServiceUnavailable, Code: qualityCode,
+						PublicMessage: qualityFailureMessage(qualityCode), AccountID: credential.ID, AccountName: credential.Name,
+						Cause: qualityErr,
+					}
+					qualityAttemptIndex++
+					s.logger.Info("quality_degraded_retry", "request_id", input.RequestID, "account_id", credential.ID, "reason", qualityCode, "quality_attempt", qualityAttemptIndex, "output_tokens", peekUsage.OutputTokens)
+					continue
+				case QualityActionReject:
+					_ = response.Body.Close()
+					lease.completeSelectorObservation(false)
+					lease.Release()
+					qualityErr := qualityFailureError(qualityCode)
+					lastErr = qualityErr
+					lastFailure = &UpstreamFailure{
+						HTTPStatus: http.StatusServiceUnavailable, Code: qualityCode,
+						PublicMessage: qualityFailureMessage(qualityCode), AccountID: credential.ID, AccountName: credential.Name,
+						Cause: qualityErr,
+					}
+					s.logger.Info("quality_degraded_rejected", "request_id", input.RequestID, "account_id", credential.ID, "reason", qualityCode)
+					break attemptLoop
+				case QualityActionDeliverLast:
+					s.logger.Info("quality_degraded_deliver_last", "request_id", input.RequestID, "account_id", credential.ID, "quality_attempt", qualityAttemptIndex, "output_tokens", peekUsage.OutputTokens)
+				}
+				if !commit.KeepBody {
+					_ = response.Body.Close()
+					lease.Release()
+					break attemptLoop
+				}
+			}
 			if diagnostic := response.RecoveredPrimaryFailure; diagnostic != nil {
 				recoveredFailure := newHTTPUpstreamFailure(diagnostic.StatusCode, diagnostic.Body, credential.ID, credential.Name)
 				if recoveredFailure.AccountBlocked || (credential.Provider == accountdomain.ProviderBuild && s.shouldInvalidateBuildForbidden(recoveredFailure)) {

@@ -302,9 +302,11 @@ type requestAuditModel struct {
 	AccountID               *uint64   `gorm:"check:chk_request_audits_account_id,account_id IS NULL OR account_id > 0"`
 	AccountName             string    `gorm:"size:160;check:chk_request_audits_account_name,length(account_name) <= 160"`
 	EgressNodeID            *uint64   `gorm:"check:chk_request_audits_egress_node_id,egress_node_id IS NULL OR egress_node_id > 0"`
+	EgressIPRecordID        *uint64   `gorm:"index:idx_request_audits_egress_ip_record"`
 	EgressNodeName          string    `gorm:"size:160;not null;default:'';check:chk_request_audits_egress_node_name,length(egress_node_name) <= 160"`
 	EgressScope             string    `gorm:"size:32;not null;default:'';check:chk_request_audits_egress_scope,egress_scope IN ('','grok_build','grok_web','grok_console','grok_web_asset','grok_console_asset')"`
 	EgressMode              string    `gorm:"size:16;not null;default:'';check:chk_request_audits_egress_mode,egress_mode IN ('','direct','proxy')"`
+	BuildBotFlagSource      int       `gorm:"not null;default:0"`
 	StatusCode              int       `gorm:"not null;check:chk_request_audits_status_code,status_code BETWEEN 100 AND 599"`
 	Streaming               bool      `gorm:"not null;default:false"`
 	MediaInputImages        int64     `gorm:"not null;default:0"`
@@ -535,6 +537,56 @@ type egressIPLeaseModel struct {
 }
 
 func (egressIPLeaseModel) TableName() string { return "egress_ip_leases" }
+
+// buildAccountRiskObservationModel snapshots the account-level marker at the
+// time a Build IP lease is actually used. It does not infer IP risk.
+type buildAccountRiskObservationModel struct {
+	ID              uint64    `gorm:"primaryKey;autoIncrement"`
+	EgressIPLeaseID uint64    `gorm:"not null;uniqueIndex:uidx_build_account_risk_lease"`
+	IPRecordID      uint64    `gorm:"not null;index:idx_build_account_risk_ip_observed,priority:1"`
+	AccountID       uint64    `gorm:"not null;index:idx_build_account_risk_account_observed,priority:1"`
+	BotFlagSource   int       `gorm:"not null;default:0;check:chk_build_account_risk_source,bot_flag_source IN (0,1,2)"`
+	ObservedAt      time.Time `gorm:"not null;index:idx_build_account_risk_ip_observed,priority:2;index:idx_build_account_risk_account_observed,priority:2"`
+	CreatedAt       time.Time `gorm:"not null"`
+	UpdatedAt       time.Time `gorm:"not null"`
+}
+
+func (buildAccountRiskObservationModel) TableName() string { return "build_account_risk_observations" }
+
+// buildEgressUsageWindowModel aggregates request headers into five-minute
+// account/IP buckets so observability does not retain individual prompts or
+// response content.
+type buildEgressUsageWindowModel struct {
+	ID              uint64    `gorm:"primaryKey;autoIncrement"`
+	IPRecordID      uint64    `gorm:"not null;uniqueIndex:uidx_build_egress_usage_window,priority:1;index:idx_build_egress_usage_recent,priority:1"`
+	AccountID       uint64    `gorm:"not null;uniqueIndex:uidx_build_egress_usage_window,priority:2"`
+	WindowStartedAt time.Time `gorm:"not null;uniqueIndex:uidx_build_egress_usage_window,priority:3;index:idx_build_egress_usage_recent,priority:2"`
+	RequestCount    uint64    `gorm:"not null;default:0"`
+	LastStatusCode  int       `gorm:"not null;default:0"`
+	FirstObservedAt time.Time `gorm:"not null"`
+	LastObservedAt  time.Time `gorm:"not null"`
+	CreatedAt       time.Time `gorm:"not null"`
+	UpdatedAt       time.Time `gorm:"not null"`
+}
+
+func (buildEgressUsageWindowModel) TableName() string { return "build_egress_usage_windows" }
+
+type buildEgressOutcomeWindowModel struct {
+	ID                     uint64    `gorm:"primaryKey;autoIncrement"`
+	IPRecordID             uint64    `gorm:"not null;uniqueIndex:uidx_build_egress_outcome_window,priority:1;index:idx_build_egress_outcome_recent,priority:1"`
+	AccountID              uint64    `gorm:"not null;uniqueIndex:uidx_build_egress_outcome_window,priority:2"`
+	Model                  string    `gorm:"size:160;not null;uniqueIndex:uidx_build_egress_outcome_window,priority:3"`
+	WindowStartedAt        time.Time `gorm:"not null;uniqueIndex:uidx_build_egress_outcome_window,priority:4;index:idx_build_egress_outcome_recent,priority:2"`
+	CompletedResponseCount uint64    `gorm:"not null;default:0"`
+	ReasoningObservedCount uint64    `gorm:"not null;default:0"`
+	MissingReasoningCount  uint64    `gorm:"not null;default:0"`
+	LastStatusCode         int       `gorm:"not null;default:0"`
+	LastObservedAt         time.Time `gorm:"not null"`
+	CreatedAt              time.Time `gorm:"not null"`
+	UpdatedAt              time.Time `gorm:"not null"`
+}
+
+func (buildEgressOutcomeWindowModel) TableName() string { return "build_egress_outcome_windows" }
 
 type egressNodeModel struct {
 	ID                          uint64  `gorm:"primaryKey;autoIncrement"`

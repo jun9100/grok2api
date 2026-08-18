@@ -24,6 +24,13 @@ func applyAuditEgress(record *audit.Record, trace *infraegress.Trace, provider a
 		id := selection.NodeID
 		record.EgressNodeID = &id
 	}
+	if selection.EgressIPRecordID != 0 {
+		id := selection.EgressIPRecordID
+		record.EgressIPRecordID = &id
+	}
+	if provider == accountdomain.ProviderBuild {
+		record.BuildBotFlagSource = selection.BuildBotFlagSource
+	}
 }
 
 func applyMediaJobEgress(job *media.Job, trace *infraegress.Trace, provider accountdomain.Provider) {

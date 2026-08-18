@@ -51,6 +51,7 @@ func (h *Handler) WithQualityGuardProbe(input egressapp.QualityProbeInput) *Hand
 
 func (h *Handler) Register(router *gin.RouterGroup) {
 	router.GET("/egress-nodes", h.list)
+	router.GET("/build-egress-risk", h.buildRiskSummary)
 	router.POST("/egress-nodes", h.create)
 	router.PATCH("/egress-nodes/batch", h.updateMany)
 	router.DELETE("/egress-nodes", h.deleteMany)
@@ -80,6 +81,33 @@ func (h *Handler) Register(router *gin.RouterGroup) {
 	router.GET("/egress-operations", h.operationsConfig)
 	router.PUT("/egress-operations", h.updateOperationsConfig)
 	router.POST("/egress-operations/rebalance", h.rebalance)
+}
+
+func (h *Handler) buildRiskSummary(c *gin.Context) {
+	window := 10 * time.Minute
+	if raw := strings.TrimSpace(c.Query("window")); raw != "" {
+		value, err := time.ParseDuration(raw)
+		if err != nil {
+			response.Error(c, http.StatusBadRequest, "invalidWindow", "window 配置无效")
+			return
+		}
+		window = value
+	}
+	limit := 100
+	if raw := strings.TrimSpace(c.Query("limit")); raw != "" {
+		value, err := strconv.Atoi(raw)
+		if err != nil {
+			response.Error(c, http.StatusBadRequest, "invalidLimit", "limit 配置无效")
+			return
+		}
+		limit = value
+	}
+	values, err := h.service.BuildRiskSummary(c.Request.Context(), window, limit)
+	if err != nil {
+		h.writeError(c, err)
+		return
+	}
+	response.Success(c, http.StatusOK, values)
 }
 
 // RegisterQualityGuard exposes the minimum egress surface required by the
@@ -393,7 +421,7 @@ func (h *Handler) testQualityGuardNode(c *gin.Context) {
 		h.writeQualityProbeError(c, err)
 		return
 	}
-	response.Success(c, http.StatusOK, gin.H{
+	payload := gin.H{
 		"requestId": value.RequestID, "nodeId": strconv.FormatUint(value.NodeID, 10), "model": value.Model,
 		"statusCode": value.StatusCode, "firstTokenMs": value.FirstTokenMS, "durationMs": value.DurationMS,
 		"generationMs": value.GenerationMS, "chunkCount": value.ChunkCount,
@@ -401,9 +429,17 @@ func (h *Handler) testQualityGuardNode(c *gin.Context) {
 		"visibleTokens": value.VisibleTokens, "visibleCharacters": value.VisibleCharacters,
 		"outputTokensPerSecond":  value.OutputTokensPerSecond,
 		"visibleTokensPerSecond": value.OutputTokensPerSecond, "expectedMatched": value.ExpectedMatched,
-		"thinkingRequired": value.ThinkingRequired,
-		"responseSha256":   value.ResponseSHA256,
-	})
+		"thinkingRequired":     value.ThinkingRequired,
+		"responseSha256":       value.ResponseSHA256,
+		"attributionAvailable": value.AttributionAvailable,
+	}
+	if value.AttributionAvailable {
+		payload["accountId"] = strconv.FormatUint(value.AccountID, 10)
+		payload["egressIpLeaseId"] = strconv.FormatUint(value.EgressIPLeaseID, 10)
+		payload["egressIpRecordId"] = strconv.FormatUint(value.EgressIPRecordID, 10)
+		payload["buildBotFlagSource"] = value.BuildBotFlagSource
+	}
+	response.Success(c, http.StatusOK, payload)
 }
 
 func (h *Handler) cleanupPreview(c *gin.Context) {

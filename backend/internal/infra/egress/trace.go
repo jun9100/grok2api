@@ -13,10 +13,14 @@ import (
 // Selection is the egress snapshot actually selected for an upstream request. It contains only metadata safe for audit
 // and excludes proxy URLs, credentials, User-Agent, and Cookies.
 type Selection struct {
-	NodeID   uint64
-	NodeName string
-	Scope    domain.Scope
-	Proxied  bool
+	NodeID             uint64
+	NodeName           string
+	Scope              domain.Scope
+	Proxied            bool
+	AccountID          uint64
+	BuildBotFlagSource int
+	EgressIPLeaseID    uint64
+	EgressIPRecordID   uint64
 }
 
 // Trace retains the most recent actual egress selection per scope. When a request retries egress, audit records the final attempt.
@@ -28,8 +32,13 @@ type Trace struct {
 
 type traceContextKey struct{}
 type accountContextKey struct{}
+type credentialContextKey struct{}
+type buildRiskModelContextKey struct{}
 type egressNodeContextKey struct{}
 type qualityProbeContextKey struct{}
+type excludedBuildEgressIPRecordContextKey struct{}
+
+type excludedBuildEgressIPRecords map[uint64]struct{}
 
 // WithAccount passes a stable Provider account identity to the egress layer. It is used only to render
 // authentication usernames for sticky proxies such as Resin and is never written to upstream headers or audit.
@@ -43,6 +52,10 @@ func WithAccount(ctx context.Context, provider string, accountID uint64) context
 // WithCredential passes the stable egress identity of a weakly linked account to Build transport;
 // unlinked accounts retain the existing Provider+ID identity.
 func WithCredential(ctx context.Context, credential accountdomain.Credential) context.Context {
+	if ctx == nil {
+		return ctx
+	}
+	ctx = context.WithValue(ctx, credentialContextKey{}, credential)
 	identity := strings.TrimSpace(credential.EgressIdentity)
 	if identity == "" {
 		provider := credential.Provider
@@ -52,6 +65,65 @@ func WithCredential(ctx context.Context, credential accountdomain.Credential) co
 		return WithEgressNode(WithAccount(ctx, string(provider), credential.ID), credential.EgressNodeID)
 	}
 	return WithEgressNode(WithAccountIdentity(ctx, identity), credential.EgressNodeID)
+}
+
+func credentialFromContext(ctx context.Context) (accountdomain.Credential, bool) {
+	if ctx == nil {
+		return accountdomain.Credential{}, false
+	}
+	credential, ok := ctx.Value(credentialContextKey{}).(accountdomain.Credential)
+	return credential, ok && credential.ID != 0
+}
+
+func WithBuildRiskModel(ctx context.Context, model string) context.Context {
+	if ctx == nil || strings.TrimSpace(model) == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, buildRiskModelContextKey{}, strings.TrimSpace(model))
+}
+
+func buildRiskModelFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	value, _ := ctx.Value(buildRiskModelContextKey{}).(string)
+	return strings.TrimSpace(value)
+}
+
+// WithExcludedBuildEgressIPRecord attaches a request-scoped exclusion used by
+// the zero-token recovery path. It holds only an internal IP-record ID, never
+// an address or proxy credential.
+func WithExcludedBuildEgressIPRecord(ctx context.Context, recordID uint64) context.Context {
+	if ctx == nil || recordID == 0 {
+		return ctx
+	}
+	records := excludedBuildEgressIPRecords{}
+	if existing, ok := ctx.Value(excludedBuildEgressIPRecordContextKey{}).(excludedBuildEgressIPRecords); ok {
+		for value := range existing {
+			records[value] = struct{}{}
+		}
+	}
+	records[recordID] = struct{}{}
+	return context.WithValue(ctx, excludedBuildEgressIPRecordContextKey{}, records)
+}
+
+// IsBuildEgressIPRecordExcluded reports whether a Build lease may use recordID
+// for this request. The constraint is intentionally request-local and does
+// not change durable lease or IP health state.
+func IsBuildEgressIPRecordExcluded(ctx context.Context, recordID uint64) bool {
+	if ctx == nil || recordID == 0 {
+		return false
+	}
+	switch value := ctx.Value(excludedBuildEgressIPRecordContextKey{}).(type) {
+	case excludedBuildEgressIPRecords:
+		_, ok := value[recordID]
+		return ok
+	case uint64:
+		// Retain compatibility with contexts created by a pre-upgrade process.
+		return value != 0 && value == recordID
+	default:
+		return false
+	}
 }
 
 // WithEgressNode attaches the explicitly assigned node ID for transports that
@@ -161,4 +233,35 @@ func recordSelection(ctx context.Context, value Selection) {
 	trace.mu.Lock()
 	trace.selections[value.Scope] = value
 	trace.mu.Unlock()
+}
+
+// RecordBuildLeaseAttribution enriches the trace after the Build transport has
+// acquired a durable IP lease. The fields are opaque database identifiers and
+// never include a proxy URL, credentials, or the actual exit address.
+func RecordBuildLeaseAttribution(ctx context.Context, lease *Lease) {
+	if lease == nil {
+		return
+	}
+	credential, ok := credentialFromContext(ctx)
+	if !ok || credential.Provider != accountdomain.ProviderBuild {
+		return
+	}
+	trace := TraceFromContext(ctx)
+	if trace == nil {
+		return
+	}
+	trace.mu.Lock()
+	defer trace.mu.Unlock()
+	selection, ok := trace.selections[domain.ScopeBuild]
+	if !ok {
+		selection = Selection{NodeID: lease.NodeID, NodeName: lease.NodeName, Scope: domain.ScopeBuild, Proxied: lease.ProxyURL != ""}
+	}
+	if selection.NodeID != 0 && lease.NodeID != 0 && selection.NodeID != lease.NodeID {
+		return
+	}
+	selection.AccountID = credential.ID
+	selection.BuildBotFlagSource = credential.BuildBotFlagSource
+	selection.EgressIPLeaseID = lease.EgressIPLeaseID
+	selection.EgressIPRecordID = lease.EgressIPRecordID
+	trace.selections[domain.ScopeBuild] = selection
 }

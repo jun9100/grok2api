@@ -46,6 +46,14 @@ INTERNAL_API_PREFIX = "/api/internal/v1/quality-guard"
 QUALITY_MARKER_PROFILE_ID = "quality-marker"
 THROUGHPUT_PROFILE_ID = "throughput"
 THINKING_GUARD_MIN_OUTPUT_TOKENS = 64
+ATTRIBUTION_CORRELATION_WINDOW_SECONDS = 15 * 60
+ATTRIBUTION_RETENTION_SECONDS = 24 * 60 * 60
+MAX_TRACKED_ACCOUNT_RISKS = 10_000
+ZERO_TOKEN_STREAM_FAILURE_CODES = frozenset({
+    "upstream_stream_incomplete",
+    "upstream_stream_interrupted",
+    "upstream_stream_idle_timeout",
+})
 
 
 class GuardDisabled(RuntimeError):
@@ -464,18 +472,34 @@ def classify_audit(value: dict[str, Any], config: Config) -> tuple[str, str, flo
     if value.get("provider") != "grok_build" or not bool(value.get("streaming")):
         return "ignored", "not_build_stream", 0.0, 0
     status = int(value.get("statusCode") or 0)
-    if status < 200 or status >= 300 or value.get("errorCode"):
+    error_code = str(value.get("errorCode") or "").strip()
+    output_tokens = max(0, int(value.get("outputTokens") or 0))
+    reasoning_tokens = max(0, int(value.get("reasoningTokens") or 0))
+    # The gateway emits this only after holding a reasoning-capable Build
+    # response with sufficient visible output and no thinking. It is an
+    # intentional quality verdict, not a transport failure, so preserve it as
+    # account/IP evidence even though the client-facing request is rejected.
+    if error_code == "quality_degraded":
+        if status >= 200 and status < 300 and output_tokens >= 32 and reasoning_tokens == 0:
+            return "hard", "missing_thinking", 0.0, output_tokens
+        return "ignored", "quality_degraded_insufficient_evidence", 0.0, output_tokens
+    # This is emitted only by the strict Agent response hold after a file-like
+    # task was deferred to manual copy/paste or a prior write failure remained
+    # unresolved. It is account/IP evidence, never a single-account node ban.
+    if error_code == "tool_action_unverified":
+        if status >= 200 and status < 300:
+            return "hard", "tool_action_unverified", 0.0, output_tokens
+        return "ignored", "tool_action_unverified_unsuccessful", 0.0, output_tokens
+    if status < 200 or status >= 300 or error_code:
         return "ignored", "unsuccessful", 0.0, 0
     first_token_ms = value.get("firstTokenMs")
     if first_token_ms is None:
         return "ignored", "missing_first_token", 0.0, 0
-    reasoning_tokens = max(0, int(value.get("reasoningTokens") or 0))
     generation_ms = generation_window_ms(
         int(first_token_ms),
         int(value.get("durationMs") or 0),
         reasoning_tokens,
     )
-    output_tokens = max(0, int(value.get("outputTokens") or 0))
     if generation_ms <= 0 or output_tokens < 32:
         return "ignored", "insufficient_output_tokens", 0.0, output_tokens
     speed = float(output_tokens) * 1000 / float(generation_ms)
@@ -486,6 +510,33 @@ def classify_audit(value: dict[str, Any], config: Config) -> tuple[str, str, flo
     if speed >= config.soft_tps:
         return "soft", "soft_tps", speed, output_tokens
     return "healthy", "within_threshold", speed, output_tokens
+
+
+def zero_token_stream_failure_code(value: dict[str, Any]) -> str:
+    """Return the guarded preflight failure code, or an empty string.
+
+    These records are emitted only by the in-process Build retry before a
+    model frame reaches the client. They are transport observations, not a
+    quality verdict, so callers must never turn them into node quarantine.
+    """
+    if value.get("provider") != "grok_build" or not bool(value.get("streaming")):
+        return ""
+    error_code = str(value.get("errorCode") or "").strip()
+    if error_code not in ZERO_TOKEN_STREAM_FAILURE_CODES:
+        return ""
+    try:
+        if int(value.get("outputTokens") or 0) != 0 or int(value.get("reasoningTokens") or 0) != 0:
+            return ""
+    except (TypeError, ValueError):
+        return ""
+    first_token_ms = value.get("firstTokenMs")
+    if first_token_ms is not None:
+        try:
+            if int(first_token_ms) > 0:
+                return ""
+        except (TypeError, ValueError):
+            return ""
+    return error_code
 
 
 def generation_window_ms(first_token_ms: int, duration_ms: int, reasoning_tokens: int = 0) -> int:
@@ -526,12 +577,34 @@ def default_node_state() -> dict[str, Any]:
     }
 
 
+def default_account_risk_state() -> dict[str, Any]:
+    return {
+        "last_observed_at": 0.0,
+        "last_anomaly_at": 0.0,
+        "last_classification": "",
+        "last_reason": "",
+        "last_source": "",
+        "last_node_id": "",
+        "last_ip_record_id": "",
+        "bot_flag_source": 0,
+        "active_anomaly_strikes": 0,
+        "passive_anomaly_strikes": 0,
+        "zero_token_interruptions": 0,
+        "last_zero_token_interruption_at": 0.0,
+        "last_zero_token_error_code": "",
+        "last_zero_token_ip_record_id": "",
+        "risk_state": "unknown",
+    }
+
+
 def default_statistics() -> dict[str, Any]:
     return {
         "started_at": time.time(),
         "active": {"total": 0, "healthy": 0, "soft": 0, "hard": 0, "errors": 0, "output_tokens": 0},
         "passive": {"total": 0, "healthy": 0, "soft": 0, "hard": 0, "errors": 0, "output_tokens": 0},
         "actions": {"quarantined": 0, "restored": 0, "suppressed": 0},
+        "attribution": {"observed": 0, "account_anomalies": 0, "cross_ip_accounts": 0, "ip_correlated": 0, "missing": 0},
+        "zero_token": {"observed": 0, "missing_account": 0, "missing_ip": 0, "ip_correlated": 0},
     }
 
 
@@ -541,7 +614,7 @@ def ensure_statistics(state: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(statistics, dict):
         raise RuntimeError("invalid quality guard statistics")
     statistics.setdefault("started_at", defaults["started_at"])
-    for group_name in ("active", "passive", "actions"):
+    for group_name in ("active", "passive", "actions", "attribution", "zero_token"):
         group = statistics.setdefault(group_name, {})
         if not isinstance(group, dict):
             raise RuntimeError("invalid quality guard statistics")
@@ -560,19 +633,22 @@ def load_state(path: Path) -> dict[str, Any]:
         with path.open("r", encoding="utf-8") as handle:
             value = json.load(handle)
     except FileNotFoundError:
-        return {"version": 1, "nodes": {}, "passive_initialized": False, "seen_audit_ids": []}
+        return {"version": 1, "nodes": {}, "account_risks": {}, "ip_risk_evidence": {}, "zero_token_ip_evidence": {}, "passive_initialized": False, "seen_audit_ids": []}
     except (OSError, ValueError) as exc:
         raise RuntimeError(f"cannot read state file: {type(exc).__name__}") from exc
     if value.get("version") != 1 or not isinstance(value.get("nodes"), dict):
         raise RuntimeError("unsupported state file format")
     value.setdefault("passive_initialized", False)
     value.setdefault("seen_audit_ids", [])
+    value.setdefault("account_risks", {})
+    value.setdefault("ip_risk_evidence", {})
+    value.setdefault("zero_token_ip_evidence", {})
     if "last_active_cycle_at" not in value:
         value["last_active_cycle_at"] = max(
             (float(node.get("last_probe_at", 0.0)) for node in value["nodes"].values()),
             default=0.0,
         )
-    if not isinstance(value["seen_audit_ids"], list):
+    if not isinstance(value["seen_audit_ids"], list) or not isinstance(value["account_risks"], dict) or not isinstance(value["ip_risk_evidence"], dict) or not isinstance(value["zero_token_ip_evidence"], dict):
         raise RuntimeError("invalid passive audit state")
     ensure_statistics(value)
     return value
@@ -616,6 +692,9 @@ class Guard:
         self._resolved_node_ids = list(config.node_ids)
         self.state.setdefault("started_at", time.time())
         self.state.setdefault("recent_events", [])
+        self.state.setdefault("account_risks", {})
+        self.state.setdefault("ip_risk_evidence", {})
+        self.state.setdefault("zero_token_ip_evidence", {})
         ensure_statistics(self.state)
         self._update_guard_metadata()
         self._save()
@@ -664,17 +743,383 @@ class Guard:
             current.setdefault(key, value)
         return current
 
-    def _defer_no_account(self, state: dict[str, Any], node: dict[str, Any], now: float, event: str, **fields: Any) -> None:
+    @staticmethod
+    def _positive_identifier(value: Any) -> str:
+        if isinstance(value, bool):
+            return ""
+        raw = str(value or "").strip()
+        if not raw.isdigit() or int(raw) < 1:
+            return ""
+        return str(int(raw))
+
+    @staticmethod
+    def _bot_flag_source(value: Any) -> int:
+        if isinstance(value, bool):
+            return 0
+        try:
+            parsed = int(str(value).strip())
+        except (TypeError, ValueError):
+            return 0
+        return parsed if parsed in {1, 2} else 0
+
+    @staticmethod
+    def _timestamp(value: Any) -> float:
+        try:
+            return max(0.0, float(value))
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _account_state_for(self, account_id: str) -> dict[str, Any]:
+        accounts = self.state.setdefault("account_risks", {})
+        current = accounts.get(account_id)
+        if not isinstance(current, dict):
+            current = {}
+            accounts[account_id] = current
+        for key, value in default_account_risk_state().items():
+            current.setdefault(key, value)
+        return current
+
+    def _remove_ip_account_evidence(self, ip_record_id: str, account_id: str) -> None:
+        evidence_by_ip = self.state.setdefault("ip_risk_evidence", {})
+        evidence = evidence_by_ip.get(ip_record_id)
+        if not isinstance(evidence, dict):
+            return
+        accounts = evidence.get("accounts")
+        if not isinstance(accounts, dict):
+            evidence_by_ip.pop(ip_record_id, None)
+            return
+        accounts.pop(account_id, None)
+        if not accounts:
+            evidence_by_ip.pop(ip_record_id, None)
+
+    def _prune_attribution_evidence(self, now: float) -> None:
+        accounts = self.state.setdefault("account_risks", {})
+        for account_id, state in list(accounts.items()):
+            if not isinstance(state, dict) or now - self._timestamp(state.get("last_observed_at")) > ATTRIBUTION_RETENTION_SECONDS:
+                accounts.pop(account_id, None)
+        if len(accounts) > MAX_TRACKED_ACCOUNT_RISKS:
+            oldest = sorted(accounts, key=lambda key: self._timestamp(accounts[key].get("last_observed_at")))
+            for account_id in oldest[:len(accounts) - MAX_TRACKED_ACCOUNT_RISKS]:
+                accounts.pop(account_id, None)
+
+        evidence_by_ip = self.state.setdefault("ip_risk_evidence", {})
+        cutoff = now - ATTRIBUTION_CORRELATION_WINDOW_SECONDS
+        for ip_record_id, evidence in list(evidence_by_ip.items()):
+            if not isinstance(evidence, dict):
+                evidence_by_ip.pop(ip_record_id, None)
+                continue
+            signals = evidence.get("accounts")
+            if not isinstance(signals, dict):
+                evidence_by_ip.pop(ip_record_id, None)
+                continue
+            for account_id, signal in list(signals.items()):
+                if not isinstance(signal, dict) or self._timestamp(signal.get("last_anomaly_at")) < cutoff:
+                    signals.pop(account_id, None)
+            if not signals:
+                evidence_by_ip.pop(ip_record_id, None)
+
+        zero_token_evidence = self.state.setdefault("zero_token_ip_evidence", {})
+        for ip_record_id, evidence in list(zero_token_evidence.items()):
+            if not isinstance(evidence, dict):
+                zero_token_evidence.pop(ip_record_id, None)
+                continue
+            signals = evidence.get("accounts")
+            if not isinstance(signals, dict):
+                zero_token_evidence.pop(ip_record_id, None)
+                continue
+            for account_id, signal in list(signals.items()):
+                if not isinstance(signal, dict) or self._timestamp(signal.get("last_interruption_at")) < cutoff:
+                    signals.pop(account_id, None)
+            if not signals:
+                zero_token_evidence.pop(ip_record_id, None)
+
+    def _record_zero_token_stream_interruption(
+        self,
+        value: dict[str, Any],
+        node: dict[str, Any],
+        error_code: str,
+        now: float,
+    ) -> str:
+        """Persist low-confidence transport evidence without changing routing.
+
+        A first-frame read interruption can come from an account, a specific
+        egress IP, or the upstream. The request retry already avoids that IP;
+        the guard retains this evidence only for later investigation and must
+        never quarantine a whole Resin node from it.
+        """
+        account_id = self._positive_identifier(value.get("accountId"))
+        node_id = str(node.get("id") or "")
+        ip_record_id = self._positive_identifier(value.get("egressIpRecordId"))
+        bot_flag_source = self._bot_flag_source(value.get("buildBotFlagSource"))
+        self._prune_attribution_evidence(now)
+        if not account_id:
+            self._bump_statistic("zero_token", "missing_account")
+            append_state_event(
+                self.state,
+                "zero_token_stream_interruption_observed",
+                node_id=node_id,
+                error_code=error_code,
+                attribution="missing_account",
+            )
+            log_event(
+                "zero_token_stream_interruption_observed",
+                node_id=node_id,
+                node_name=node.get("name"),
+                error_code=error_code,
+                attribution="missing_account",
+            )
+            return "missing_account"
+
+        state = self._account_state_for(account_id)
+        state.update({
+            "last_observed_at": now,
+            "last_zero_token_interruption_at": now,
+            "last_zero_token_error_code": error_code,
+            "last_zero_token_ip_record_id": ip_record_id,
+            "last_node_id": node_id,
+            "bot_flag_source": bot_flag_source,
+        })
+        state["zero_token_interruptions"] = int(state.get("zero_token_interruptions", 0)) + 1
+        self._bump_statistic("zero_token", "observed")
+
+        if not ip_record_id:
+            self._bump_statistic("zero_token", "missing_ip")
+            append_state_event(
+                self.state,
+                "zero_token_stream_interruption_observed",
+                node_id=node_id,
+                account_id=account_id,
+                error_code=error_code,
+                attribution="missing_ip",
+            )
+            log_event(
+                "zero_token_stream_interruption_observed",
+                node_id=node_id,
+                node_name=node.get("name"),
+                account_id=account_id,
+                bot_flag_source=bot_flag_source,
+                error_code=error_code,
+                attribution="missing_ip",
+            )
+            return "missing_ip"
+
+        evidence_by_ip = self.state.setdefault("zero_token_ip_evidence", {})
+        evidence = evidence_by_ip.get(ip_record_id)
+        if not isinstance(evidence, dict):
+            evidence = {}
+            evidence_by_ip[ip_record_id] = evidence
+        signals = evidence.get("accounts")
+        if not isinstance(signals, dict):
+            signals = {}
+            evidence["accounts"] = signals
+        evidence["last_observed_at"] = now
+        signals[account_id] = {
+            "last_interruption_at": now,
+            "error_code": error_code,
+            "node_id": node_id,
+        }
+        correlated_accounts = sorted(
+            candidate_id
+            for candidate_id, signal in signals.items()
+            if isinstance(signal, dict)
+            and self._timestamp(signal.get("last_interruption_at")) >= now - ATTRIBUTION_CORRELATION_WINDOW_SECONDS
+        )
+        if len(correlated_accounts) >= 2:
+            self._bump_statistic("zero_token", "ip_correlated")
+            append_state_event(
+                self.state,
+                "zero_token_stream_ip_correlated",
+                node_id=node_id,
+                ip_record_id=ip_record_id,
+                account_count=len(correlated_accounts),
+                error_code=error_code,
+            )
+            log_event(
+                "zero_token_stream_ip_correlated",
+                node_id=node_id,
+                node_name=node.get("name"),
+                ip_record_id=ip_record_id,
+                account_count=len(correlated_accounts),
+                error_code=error_code,
+                action="observe_only",
+            )
+            return "ip_correlated"
+
+        append_state_event(
+            self.state,
+            "zero_token_stream_interruption_observed",
+            node_id=node_id,
+            account_id=account_id,
+            ip_record_id=ip_record_id,
+            error_code=error_code,
+            attribution="account_ip",
+        )
+        log_event(
+            "zero_token_stream_interruption_observed",
+            node_id=node_id,
+            node_name=node.get("name"),
+            account_id=account_id,
+            ip_record_id=ip_record_id,
+            bot_flag_source=bot_flag_source,
+            error_code=error_code,
+            attribution="account_ip",
+        )
+        return "observed"
+
+    def _record_account_signal(
+        self,
+        value: dict[str, Any],
+        node: dict[str, Any],
+        classification: str,
+        reason: str,
+        source: str,
+        now: float,
+    ) -> str:
+        account_id = self._positive_identifier(value.get("accountId"))
+        if not account_id:
+            self._bump_statistic("attribution", "missing")
+            return "missing"
+        ip_record_id = self._positive_identifier(value.get("egressIpRecordId"))
+        node_id = str(node.get("id") or "")
+        bot_flag_source = self._bot_flag_source(value.get("buildBotFlagSource"))
+        self._prune_attribution_evidence(now)
+        state = self._account_state_for(account_id)
+        strikes_key = f"{source}_anomaly_strikes"
+        state.update({
+            "last_observed_at": now,
+            "last_classification": classification,
+            "last_reason": reason,
+            "last_source": source,
+            "last_node_id": node_id,
+            "last_ip_record_id": ip_record_id,
+            "bot_flag_source": bot_flag_source,
+        })
+        self._bump_statistic("attribution", "observed")
+        if classification == "healthy":
+            state[strikes_key] = 0
+            state["risk_state"] = "healthy"
+            if ip_record_id:
+                self._remove_ip_account_evidence(ip_record_id, account_id)
+            return "healthy"
+        if classification not in {"soft", "hard"}:
+            return "ignored"
+
+        state["last_anomaly_at"] = now
+        if classification == "hard":
+            state[strikes_key] = max(int(state.get(strikes_key, 0)), self.config.consecutive_soft)
+        else:
+            state[strikes_key] = int(state.get(strikes_key, 0)) + 1
+        actionable = classification == "hard" or int(state[strikes_key]) >= self.config.consecutive_soft
+        state["risk_state"] = "account_suspected" if actionable else "account_observed"
+        self._bump_statistic("attribution", "account_anomalies")
+
+        if ip_record_id:
+            evidence_by_ip = self.state.setdefault("ip_risk_evidence", {})
+            evidence = evidence_by_ip.get(ip_record_id)
+            if not isinstance(evidence, dict):
+                evidence = {}
+                evidence_by_ip[ip_record_id] = evidence
+            signals = evidence.get("accounts")
+            if not isinstance(signals, dict):
+                signals = {}
+                evidence["accounts"] = signals
+            evidence["last_observed_at"] = now
+            signals[account_id] = {
+                "last_anomaly_at": now,
+                "classification": classification,
+                "reason": reason,
+                "source": source,
+                "node_id": node_id,
+                "actionable": actionable,
+            }
+            correlated_accounts = sorted(
+                candidate_id
+                for candidate_id, signal in signals.items()
+                if isinstance(signal, dict)
+                and bool(signal.get("actionable"))
+                and self._timestamp(signal.get("last_anomaly_at")) >= now - ATTRIBUTION_CORRELATION_WINDOW_SECONDS
+            )
+            if len(correlated_accounts) >= 2:
+                state["risk_state"] = "ip_correlated"
+                self._bump_statistic("attribution", "ip_correlated")
+                append_state_event(
+                    self.state,
+                    "ip_risk_correlated",
+                    node_id=node_id,
+                    reason=reason,
+                    classification=classification,
+                )
+                log_event(
+                    "ip_risk_correlated",
+                    node_id=node_id,
+                    node_name=node.get("name"),
+                    ip_record_id=ip_record_id,
+                    account_count=len(correlated_accounts),
+                    reason=reason,
+                    classification=classification,
+                )
+                return "ip_correlated"
+            if actionable:
+                cross_ip_records = []
+                for candidate_ip, candidate_evidence in evidence_by_ip.items():
+                    candidate_signals = candidate_evidence.get("accounts") if isinstance(candidate_evidence, dict) else None
+                    candidate = candidate_signals.get(account_id) if isinstance(candidate_signals, dict) else None
+                    if isinstance(candidate, dict) and bool(candidate.get("actionable")) and self._timestamp(candidate.get("last_anomaly_at")) >= now - ATTRIBUTION_CORRELATION_WINDOW_SECONDS:
+                        cross_ip_records.append(candidate_ip)
+                if len(cross_ip_records) >= 2:
+                    state["risk_state"] = "account_cross_ip_suspected"
+                    self._bump_statistic("attribution", "cross_ip_accounts")
+                    append_state_event(
+                        self.state,
+                        "account_cross_ip_risk",
+                        node_id=node_id,
+                        reason=reason,
+                        classification=classification,
+                    )
+                    log_event(
+                        "account_cross_ip_risk",
+                        node_id=node_id,
+                        node_name=node.get("name"),
+                        account_id=account_id,
+                        ip_record_count=len(cross_ip_records),
+                        reason=reason,
+                        classification=classification,
+                    )
+
+        append_state_event(
+            self.state,
+            "account_risk_observed",
+            node_id=node_id,
+            reason=reason,
+            classification=classification,
+        )
+        log_event(
+            "account_risk_observed",
+            node_id=node_id,
+            node_name=node.get("name"),
+            account_id=account_id,
+            ip_record_id=ip_record_id,
+            bot_flag_source=bot_flag_source,
+            source=source,
+            classification=classification,
+            reason=reason,
+            actionable=actionable,
+        )
+        return "account_suspected" if actionable else "account_observed"
+
+    def _defer_probe(self, state: dict[str, Any], node: dict[str, Any], now: float, event: str, reason: str, **fields: Any) -> None:
         state["last_probe_at"] = now
-        state["last_reason"] = "probe_no_account"
+        state["last_reason"] = reason
+        state["error_strikes"] = 0
         state["quarantined_until"] = max(
             float(state.get("quarantined_until", 0.0)),
             now + self.config.no_account_backoff_seconds,
         )
-        last_logged = float(state.get("last_no_account_log_at", 0.0))
+        log_key = "last_no_account_log_at" if reason == "probe_no_account" else "last_unavailable_log_at"
+        last_logged = float(state.get(log_key, 0.0))
         if last_logged <= 0 or now - last_logged >= self.config.no_account_backoff_seconds:
-            state["last_no_account_log_at"] = now
-            log_event(event, node_id=str(node["id"]), node_name=node.get("name"), reason="probe_no_account", **fields)
+            state[log_key] = now
+            log_event(event, node_id=str(node["id"]), node_name=node.get("name"), reason=reason, **fields)
 
     def _eligible_nodes(self, nodes: list[dict[str, Any]], protected_node_ids: set[str]) -> list[dict[str, Any]]:
         configured = set(self.config.node_ids)
@@ -707,16 +1152,21 @@ class Guard:
         return (
             bool(self.config.rotation_url)
             and node_id in set(self.config.rotatable_node_ids)
-            and reason in {
+            and (reason.startswith("ip_correlated_") or reason in {
                 "hard_tps", "soft_tps", "buffered_burst", "missing_thinking", "expected_marker_missing",
                 "insufficient_output_tokens", "insufficient_generation_window", "probe_errors",
                 "recovery_probe_error", "rotation_error",
-            }
+            })
         )
 
     @staticmethod
-    def _probe_account_unavailable(exc: Exception) -> bool:
-        return isinstance(exc, ApiError) and exc.code == "egressQualityProbeNoAccount"
+    def _probe_deferred_reason(exc: Exception) -> str:
+        if not isinstance(exc, ApiError):
+            return ""
+        return {
+            "egressQualityProbeNoAccount": "probe_no_account",
+            "egressQualityProbeUnavailable": "probe_unavailable",
+        }.get(exc.code, "")
 
     def _quarantine(self, nodes: list[dict[str, Any]], node: dict[str, Any], reason: str, now: float, recover_now: bool = True) -> None:
         node_id = str(node["id"])
@@ -794,7 +1244,7 @@ class Guard:
                 self._save()
                 log_event("node_rotated", node_id=node_id, node_name=node.get("name"), exit_ip=str(rotation.get("newExitIp") or ""), trigger="passive_hold")
 
-    def _record_probe(self, node: dict[str, Any], result: dict[str, Any], classification: str, reason: str, now: float) -> None:
+    def _record_probe(self, node: dict[str, Any], result: dict[str, Any], classification: str, reason: str, now: float) -> str:
         node_id = str(node["id"])
         state = self._state_for(node_id)
         output_tokens = int(result.get("outputTokens") or result.get("visibleTokens") or 0)
@@ -837,6 +1287,7 @@ class Guard:
             chunk_count=int(result.get("chunkCount") or 0),
             expected_matched=bool(result.get("expectedMatched")),
         )
+        return self._record_account_signal(result, node, classification, reason, "active", now)
 
     def _probe_active(self, nodes: list[dict[str, Any]], node: dict[str, Any], now: float, trigger: str = "scheduled") -> None:
         node_id = str(node["id"])
@@ -848,8 +1299,9 @@ class Guard:
         try:
             result = self.api.quality_test(node_id, profile_id)
         except Exception as exc:
-            if self._probe_account_unavailable(exc):
-                self._defer_no_account(state, node, now, "quality_probe_deferred", trigger=trigger)
+            deferred_reason = self._probe_deferred_reason(exc)
+            if deferred_reason:
+                self._defer_probe(state, node, now, "quality_probe_deferred", deferred_reason, trigger=trigger)
                 return
             self._bump_statistic("active", "errors")
             state["error_strikes"] = int(state.get("error_strikes", 0)) + 1
@@ -859,7 +1311,12 @@ class Guard:
                 self._quarantine(nodes, node, "probe_errors", now)
             return
         classification, reason = classify_result(result, self.config, profile)
-        self._record_probe(node, result, classification, reason, now)
+        attribution = self._record_probe(node, result, classification, reason, now)
+        if attribution == "ip_correlated":
+            self._quarantine(nodes, node, "ip_correlated_" + reason, now)
+            return
+        if attribution != "missing":
+            return
         if classification == "hard" or (
             classification == "soft" and self.config.fail_closed
         ) or int(state.get("active_soft_strikes", 0)) >= self.config.consecutive_soft:
@@ -909,8 +1366,9 @@ class Guard:
             classification, reason = classify_result(result, self.config, profile)
             self._record_probe(node, result, classification, reason, now)
         except Exception as exc:
-            if self._probe_account_unavailable(exc):
-                self._defer_no_account(state, node, now, "recovery_probe_deferred")
+            deferred_reason = self._probe_deferred_reason(exc)
+            if deferred_reason:
+                self._defer_probe(state, node, now, "recovery_probe_deferred", deferred_reason)
                 return
             self._bump_statistic("active", "errors")
             state["quarantined_until"] = now + self.config.quarantine_seconds
@@ -1114,6 +1572,10 @@ class Guard:
         return collected
 
     def _record_passive_audit(self, all_nodes: list[dict[str, Any]], node: dict[str, Any], audit_value: dict[str, Any], now: float) -> None:
+        zero_token_error_code = zero_token_stream_failure_code(audit_value)
+        if zero_token_error_code:
+            self._record_zero_token_stream_interruption(audit_value, node, zero_token_error_code, now)
+            return
         node_id = str(node["id"])
         state = self._state_for(node_id)
         classification, reason, speed, output_tokens = classify_audit(audit_value, self.config)
@@ -1131,6 +1593,7 @@ class Guard:
             "last_first_token_ms": int(audit_value.get("firstTokenMs") or 0),
             "last_duration_ms": int(audit_value.get("durationMs") or 0),
         })
+        attribution = self._record_account_signal(audit_value, node, classification, reason, "passive", now)
         if classification == "healthy":
             state["passive_soft_strikes"] = 0
             state["passive_degrade_repeats"] = 0
@@ -1139,6 +1602,10 @@ class Guard:
             state["passive_soft_strikes"] = int(state.get("passive_soft_strikes", 0)) + 1
         else:
             state["passive_soft_strikes"] = self.config.consecutive_soft
+        if attribution == "ip_correlated":
+            reason = "ip_correlated_" + reason
+        elif attribution != "missing":
+            return
         append_state_event(
             self.state,
             "passive_audit_anomaly",

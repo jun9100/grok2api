@@ -148,6 +148,7 @@ func (value IPLeaseState) IsValid() bool {
 type IPLease struct {
 	ID             uint64
 	IPRecordID     uint64
+	ExitIP         string
 	AccountID      uint64
 	Scope          Scope
 	EgressNodeID   uint64
@@ -170,6 +171,41 @@ type IPLeaseAcquireInput struct {
 	MaxAccounts  int
 	Now          time.Time
 	ExpiresAt    time.Time
+}
+
+// BuildRequestObservation is a privacy-preserving egress attribution sample.
+// It contains no token, prompt, proxy URL, or response body.
+type BuildRequestObservation struct {
+	LeaseID       uint64
+	AccountID     uint64
+	BotFlagSource int
+	StatusCode    int
+	ObservedAt    time.Time
+}
+
+type BuildResponseOutcome struct {
+	LeaseID           uint64
+	AccountID         uint64
+	Model             string
+	StatusCode        int
+	ReasoningObserved bool
+	ObservedAt        time.Time
+}
+
+type BuildEgressRiskSummary struct {
+	IPRecordID             uint64
+	ExitIP                 string
+	ActiveLeaseCount       uint64
+	WindowAccountCount     uint64
+	WindowRequestCount     uint64
+	BotFlagOneAccountCount uint64
+	BotFlagTwoAccountCount uint64
+	CompletedResponseCount uint64
+	ReasoningObservedCount uint64
+	MissingReasoningCount  uint64
+	RiskState              string
+	WindowStartedAt        time.Time
+	LastObservedAt         time.Time
 }
 
 // SubscriptionSource stores a write-only remote proxy subscription. The URL

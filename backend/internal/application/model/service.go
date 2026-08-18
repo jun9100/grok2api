@@ -255,6 +255,20 @@ func (s *Service) GetByProviderUpstream(ctx context.Context, providerValue accou
 	return s.models.GetByProviderUpstream(ctx, providerValue, upstreamModel)
 }
 
+// EnsureQualityProbeBuildRoute repairs a missing managed route for the
+// server-owned Build quality probe. Account capability checks still happen in
+// the normal selector, so this does not make an unsupported account eligible.
+func (s *Service) EnsureQualityProbeBuildRoute(ctx context.Context, upstreamModel string) error {
+	upstreamModel, ok := modeldomain.NormalizeUpstreamModel(account.ProviderBuild, upstreamModel)
+	if !ok {
+		return fmt.Errorf("%w: Build quality probe model is invalid", ErrInvalidInput)
+	}
+	if err := s.models.UpsertDiscovered(ctx, account.ProviderBuild, []string{upstreamModel}); err != nil {
+		return fmt.Errorf("ensure Build quality probe route: %w", err)
+	}
+	return nil
+}
+
 func (s *Service) Create(ctx context.Context, input CreateInput) (modeldomain.Route, error) {
 	publicID, validPublicID := modeldomain.NormalizePublicID(input.Provider, input.PublicID)
 	if !validPublicID {

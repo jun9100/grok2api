@@ -152,6 +152,47 @@ class ClassificationTests(unittest.TestCase):
         self.assertEqual(quality_guard.classify_audit(short, cfg)[0], "ignored")
         self.assertEqual(quality_guard.classify_audit(failed, cfg)[0], "ignored")
 
+    def test_passive_quality_degraded_is_missing_thinking_evidence(self):
+        value = {
+            "provider": "grok_build", "streaming": True, "statusCode": 200,
+            "errorCode": "quality_degraded", "outputTokens": 64,
+            "reasoningTokens": 0,
+        }
+        self.assertEqual(
+            quality_guard.classify_audit(value, config())[:2],
+            ("hard", "missing_thinking"),
+        )
+        self.assertEqual(
+            quality_guard.classify_audit({**value, "outputTokens": 31}, config())[0],
+            "ignored",
+        )
+
+    def test_passive_tool_action_unverified_is_attributed_quality_evidence(self):
+        value = {
+            "provider": "grok_build", "streaming": True, "statusCode": 200,
+            "errorCode": "tool_action_unverified", "outputTokens": 12,
+            "reasoningTokens": 8,
+        }
+        self.assertEqual(
+            quality_guard.classify_audit(value, config())[:2],
+            ("hard", "tool_action_unverified"),
+        )
+        self.assertEqual(
+            quality_guard.classify_audit({**value, "statusCode": 503}, config())[0],
+            "ignored",
+        )
+
+    def test_zero_token_preflight_failure_is_distinguished_from_quality_audit(self):
+        value = {
+            "provider": "grok_build", "streaming": True, "statusCode": 200,
+            "outputTokens": 0, "reasoningTokens": 0,
+            "errorCode": "upstream_stream_interrupted",
+        }
+        self.assertEqual(quality_guard.classify_audit(value, config())[0], "ignored")
+        self.assertEqual(quality_guard.zero_token_stream_failure_code(value), "upstream_stream_interrupted")
+        self.assertEqual(quality_guard.zero_token_stream_failure_code({**value, "outputTokens": 1}), "")
+        self.assertEqual(quality_guard.zero_token_stream_failure_code({**value, "firstTokenMs": 12}), "")
+
 
 class StateTests(unittest.TestCase):
     def test_state_write_is_atomic_and_private(self):
@@ -164,6 +205,7 @@ class StateTests(unittest.TestCase):
             self.assertFalse(loaded["passive_initialized"])
             self.assertEqual(loaded["seen_audit_ids"], [])
             self.assertEqual(loaded["statistics"]["active"]["total"], 0)
+            self.assertEqual(loaded["zero_token_ip_evidence"], {})
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
 
 
@@ -622,6 +664,27 @@ class GuardTests(unittest.TestCase):
             self.assertTrue(state["disabled_by_guard"])
             self.assertEqual(state["quarantined_until"], recovery_at + cfg.no_account_backoff_seconds)
 
+    def test_probe_backend_unavailable_is_deferred_without_quarantine(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = config(
+                state_file=Path(directory) / "state.json",
+                lock_file=Path(directory) / "lock",
+                node_ids=("1",),
+                fail_closed=True,
+                consecutive_errors=1,
+            )
+            unavailable = quality_guard.ApiError(503, "egressQualityProbeUnavailable", "route unavailable")
+            api = FakeApi(self.nodes(3), [unavailable])
+            guard = quality_guard.Guard(cfg, api)
+
+            guard.run_active_cycle()
+
+            self.assertEqual(api.enabled_calls, [])
+            self.assertEqual(api.rotation_calls, [])
+            state = guard.state["nodes"]["1"]
+            self.assertEqual(state["error_strikes"], 0)
+            self.assertEqual(state["last_reason"], "probe_unavailable")
+
     def test_fail_closed_buffered_burst_restores_same_ip_after_one_good_probe(self):
         with tempfile.TemporaryDirectory() as directory:
             cfg = config(
@@ -937,17 +1000,177 @@ class GuardTests(unittest.TestCase):
             self.assertEqual(api.quality_calls, [])
             self.assertTrue(guard.state["nodes"]["2"]["disabled_by_guard"])
 
+    def test_zero_token_interruption_is_observed_without_quarantining_a_node(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = config(
+                state_file=Path(directory) / "state.json", lock_file=Path(directory) / "lock",
+                mode="passive", node_ids=("1",),
+            )
+            api = FakeApi(self.nodes(), [], [
+                {"items": [], "hasMore": False, "nextCursor": ""},
+                {"items": [self.zero_token_audit("zero-101", "1", 101, 501)], "hasMore": False, "nextCursor": ""},
+            ])
+            guard = quality_guard.Guard(cfg, api)
+
+            guard.run_passive_cycle()
+            guard.run_passive_cycle()
+
+            self.assertEqual(api.enabled_calls, [])
+            self.assertTrue(api.nodes[0]["enabled"])
+            self.assertEqual(guard.state["account_risks"]["101"]["zero_token_interruptions"], 1)
+            self.assertEqual(guard.state["account_risks"]["101"]["risk_state"], "unknown")
+            self.assertEqual(guard.state["zero_token_ip_evidence"]["501"]["accounts"]["101"]["error_code"], "upstream_stream_interrupted")
+            self.assertEqual(guard.state["statistics"]["zero_token"], {
+                "observed": 1, "missing_account": 0, "missing_ip": 0, "ip_correlated": 0,
+            })
+
+    def test_zero_token_same_ip_correlation_stays_observe_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = config(
+                state_file=Path(directory) / "state.json", lock_file=Path(directory) / "lock",
+                mode="passive", node_ids=("1",),
+            )
+            api = FakeApi(self.nodes(), [], [
+                {"items": [], "hasMore": False, "nextCursor": ""},
+                {"items": [self.zero_token_audit("zero-101", "1", 101, 501)], "hasMore": False, "nextCursor": ""},
+                {"items": [self.zero_token_audit("zero-102", "1", 102, 501)], "hasMore": False, "nextCursor": ""},
+            ])
+            guard = quality_guard.Guard(cfg, api)
+
+            guard.run_passive_cycle()
+            guard.run_passive_cycle()
+            guard.run_passive_cycle()
+
+            self.assertEqual(api.enabled_calls, [])
+            self.assertTrue(api.nodes[0]["enabled"])
+            self.assertEqual(sorted(guard.state["zero_token_ip_evidence"]["501"]["accounts"]), ["101", "102"])
+            self.assertEqual(guard.state["statistics"]["zero_token"]["ip_correlated"], 1)
+
+    def test_attributed_active_single_account_anomaly_does_not_quarantine_node(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = config(state_file=Path(directory) / "state.json", lock_file=Path(directory) / "lock", node_ids=("1",))
+            api = FakeApi(self.nodes(), [self.probe(101, 501)])
+            guard = quality_guard.Guard(cfg, api)
+
+            guard.run_active_cycle()
+
+            self.assertEqual(api.enabled_calls, [])
+            self.assertTrue(api.nodes[0]["enabled"])
+            self.assertEqual(guard.state["account_risks"]["101"]["risk_state"], "account_suspected")
+            self.assertTrue(guard.state["ip_risk_evidence"]["501"]["accounts"]["101"]["actionable"])
+            self.assertEqual(guard.state["statistics"]["attribution"]["account_anomalies"], 1)
+
+    def test_attributed_active_two_accounts_on_same_ip_quarantine_node(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = config(state_file=Path(directory) / "state.json", lock_file=Path(directory) / "lock", node_ids=("1",))
+            api = FakeApi(self.nodes(), [self.probe(101, 501), self.probe(102, 501)])
+            guard = quality_guard.Guard(cfg, api)
+
+            guard._probe_active(api.nodes, api.nodes[0], 100.0)
+            self.assertEqual(api.enabled_calls, [])
+            guard._probe_active(api.nodes, api.nodes[0], 101.0)
+
+            self.assertEqual(api.enabled_calls, [("1", False)])
+            self.assertTrue(guard.state["nodes"]["1"]["disabled_by_guard"])
+            self.assertEqual(guard.state["nodes"]["1"]["last_reason"], "ip_correlated_hard_tps")
+            self.assertEqual(guard.state["statistics"]["attribution"]["ip_correlated"], 1)
+
+    def test_attributed_active_same_account_on_two_ips_does_not_quarantine_node(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = config(state_file=Path(directory) / "state.json", lock_file=Path(directory) / "lock", node_ids=("1",))
+            api = FakeApi(self.nodes(), [self.probe(101, 501), self.probe(101, 502)])
+            guard = quality_guard.Guard(cfg, api)
+
+            guard._probe_active(api.nodes, api.nodes[0], 100.0)
+            guard._probe_active(api.nodes, api.nodes[0], 101.0)
+
+            self.assertEqual(api.enabled_calls, [])
+            self.assertTrue(api.nodes[0]["enabled"])
+            self.assertEqual(guard.state["account_risks"]["101"]["risk_state"], "account_cross_ip_suspected")
+            self.assertEqual(guard.state["statistics"]["attribution"]["cross_ip_accounts"], 1)
+
+    def test_attributed_passive_audits_wait_for_two_accounts_before_quarantine(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = config(state_file=Path(directory) / "state.json", lock_file=Path(directory) / "lock", mode="passive", node_ids=("1",))
+            api = FakeApi(self.nodes(), [], [
+                {"items": [], "hasMore": False, "nextCursor": ""},
+                {"items": [self.audit("account-101", "1", 1200, account_id=101, ip_record_id=501)], "hasMore": False, "nextCursor": ""},
+                {"items": [self.audit("account-102", "1", 1200, account_id=102, ip_record_id=501)], "hasMore": False, "nextCursor": ""},
+            ])
+            guard = quality_guard.Guard(cfg, api)
+
+            guard.run_passive_cycle()
+            guard.run_passive_cycle()
+            self.assertEqual(api.enabled_calls, [])
+            self.assertEqual(guard.state["account_risks"]["101"]["risk_state"], "account_suspected")
+
+            guard.run_passive_cycle()
+
+            self.assertEqual(api.enabled_calls, [("1", False)])
+            self.assertTrue(guard.state["nodes"]["1"]["disabled_by_guard"])
+            self.assertEqual(guard.state["nodes"]["1"]["last_reason"], "ip_correlated_hard_tps")
+
+    def test_attributed_quality_degraded_waits_for_two_accounts_before_quarantine(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = config(state_file=Path(directory) / "state.json", lock_file=Path(directory) / "lock", mode="passive", node_ids=("1",))
+            first = self.audit("quality-101", "1", 40, account_id=101, ip_record_id=501)
+            second = self.audit("quality-102", "1", 40, account_id=102, ip_record_id=501)
+            for value in (first, second):
+                value.update({"errorCode": "quality_degraded", "outputTokens": 64, "reasoningTokens": 0, "firstTokenMs": None})
+            api = FakeApi(self.nodes(), [], [
+                {"items": [], "hasMore": False, "nextCursor": ""},
+                {"items": [first], "hasMore": False, "nextCursor": ""},
+                {"items": [second], "hasMore": False, "nextCursor": ""},
+            ])
+            guard = quality_guard.Guard(cfg, api)
+
+            guard.run_passive_cycle()
+            guard.run_passive_cycle()
+            self.assertEqual(api.enabled_calls, [])
+
+            guard.run_passive_cycle()
+
+            self.assertEqual(api.enabled_calls, [("1", False)])
+            self.assertEqual(guard.state["nodes"]["1"]["last_reason"], "ip_correlated_missing_thinking")
+
     @staticmethod
-    def audit(audit_id, node_id, output_tps, quality_probe=False):
+    def probe(account_id, ip_record_id, output_tps=1200):
+        return {
+            "expectedMatched": True, "outputTokens": 100, "reasoningTokens": 40,
+            "outputTokensPerSecond": output_tps, "generationMs": 1500,
+            "accountId": str(account_id), "egressIpRecordId": str(ip_record_id),
+            "buildBotFlagSource": 2,
+        }
+
+    @staticmethod
+    def audit(audit_id, node_id, output_tps, quality_probe=False, account_id=None, ip_record_id=None):
         generation_ms = 2000
         output_tokens = int(output_tps * generation_ms / 1000)
-        return {
+        value = {
             "id": audit_id, "requestId": f"request-{audit_id}", "qualityProbe": quality_probe,
             "provider": "grok_build", "streaming": True,
             "statusCode": 200, "firstTokenMs": 200, "durationMs": 200 + generation_ms,
             "outputTokens": output_tokens, "reasoningTokens": min(100, max(0, output_tokens - 1)),
             "egressNodeId": node_id, "errorCode": None,
         }
+        if account_id is not None:
+            value["accountId"] = str(account_id)
+        if ip_record_id is not None:
+            value["egressIpRecordId"] = str(ip_record_id)
+            value["buildBotFlagSource"] = 2
+        return value
+
+    @staticmethod
+    def zero_token_audit(audit_id, node_id, account_id, ip_record_id):
+        value = GuardTests.audit(audit_id, node_id, 0, account_id=account_id, ip_record_id=ip_record_id)
+        value.update({
+            "firstTokenMs": None,
+            "durationMs": 120,
+            "outputTokens": 0,
+            "reasoningTokens": 0,
+            "errorCode": "upstream_stream_interrupted",
+        })
+        return value
 
 
 if __name__ == "__main__":

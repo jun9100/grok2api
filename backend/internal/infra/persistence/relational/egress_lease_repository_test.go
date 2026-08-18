@@ -146,6 +146,82 @@ func TestAcquireBuildEgressIPLeaseConcurrentCapacity(t *testing.T) {
 	}
 }
 
+func TestObserveBuildEgressRequestAggregatesUsageAndSnapshotsAccountRisk(t *testing.T) {
+	ctx := context.Background()
+	database := openTestDatabase(t)
+	leases := NewEgressRepository(database)
+	now := time.Date(2026, time.August, 17, 10, 7, 0, 0, time.UTC)
+	record := createEgressIPLeaseRecord(t, database, now, "198.51.100.13")
+	lease, created, err := leases.AcquireBuildEgressIPLease(ctx, egress.IPLeaseAcquireInput{
+		IPRecordID: record.ID, AccountID: 21, MaxAccounts: 3, Now: now, ExpiresAt: now.Add(time.Hour),
+	})
+	if err != nil || !created {
+		t.Fatalf("lease=%#v created=%v err=%v", lease, created, err)
+	}
+	for _, status := range []int{200, 429} {
+		if err := leases.ObserveBuildEgressRequest(ctx, egress.BuildRequestObservation{
+			LeaseID: lease.ID, AccountID: 21, BotFlagSource: 2, StatusCode: status, ObservedAt: now,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var risk buildAccountRiskObservationModel
+	if err := database.db.Where("egress_ip_lease_id = ?", lease.ID).Take(&risk).Error; err != nil {
+		t.Fatal(err)
+	}
+	if risk.IPRecordID != record.ID || risk.AccountID != 21 || risk.BotFlagSource != 2 || !risk.ObservedAt.Equal(now) {
+		t.Fatalf("risk=%#v", risk)
+	}
+	var usage buildEgressUsageWindowModel
+	if err := database.db.Where("ip_record_id = ? AND account_id = ?", record.ID, 21).Take(&usage).Error; err != nil {
+		t.Fatal(err)
+	}
+	if usage.RequestCount != 2 || usage.LastStatusCode != 429 || !usage.WindowStartedAt.Equal(now.Truncate(5*time.Minute)) {
+		t.Fatalf("usage=%#v", usage)
+	}
+}
+
+func TestListBuildEgressRiskSummariesKeepsEmptyObservationWindows(t *testing.T) {
+	ctx := context.Background()
+	database := openTestDatabase(t)
+	leases := NewEgressRepository(database)
+	now := time.Date(2026, time.August, 17, 10, 7, 0, 0, time.UTC)
+	observed := createEgressIPLeaseRecord(t, database, now, "198.51.100.14")
+	empty := createEgressIPLeaseRecord(t, database, now.Add(time.Second), "198.51.100.15")
+
+	lease, created, err := leases.AcquireBuildEgressIPLease(ctx, egress.IPLeaseAcquireInput{
+		IPRecordID: observed.ID, AccountID: 31, MaxAccounts: 3, Now: now, ExpiresAt: now.Add(time.Hour),
+	})
+	if err != nil || !created {
+		t.Fatalf("lease=%#v created=%v err=%v", lease, created, err)
+	}
+	if err := leases.ObserveBuildEgressRequest(ctx, egress.BuildRequestObservation{
+		LeaseID: lease.ID, AccountID: 31, BotFlagSource: 0, StatusCode: 200, ObservedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := leases.ObserveBuildEgressOutcome(ctx, egress.BuildResponseOutcome{
+		LeaseID: lease.ID, AccountID: 31, Model: "grok-4.5", StatusCode: 200, ObservedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	summaries, err := leases.ListBuildEgressRiskSummaries(ctx, now.Add(-time.Minute), 10)
+	if err != nil {
+		t.Fatalf("list summaries: %v", err)
+	}
+	byIP := make(map[string]egress.BuildEgressRiskSummary, len(summaries))
+	for _, summary := range summaries {
+		byIP[summary.ExitIP] = summary
+	}
+	if got := byIP[observed.ExitIP]; got.WindowRequestCount != 1 || got.CompletedResponseCount != 1 || got.LastObservedAt.IsZero() {
+		t.Fatalf("observed summary=%#v", got)
+	}
+	if got := byIP[empty.ExitIP]; got.WindowRequestCount != 0 || got.CompletedResponseCount != 0 || !got.LastObservedAt.IsZero() {
+		t.Fatalf("empty summary=%#v", got)
+	}
+}
+
 func createEgressIPLeaseRecord(t *testing.T, database *Database, now time.Time, exitIP string) egressIPRecordModel {
 	t.Helper()
 	record := egressIPRecordModel{

@@ -18,9 +18,11 @@ import (
 	egressapp "github.com/chenyme/grok2api/backend/internal/application/egress"
 	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
 	"github.com/chenyme/grok2api/backend/internal/domain/audit"
+	egressdomain "github.com/chenyme/grok2api/backend/internal/domain/egress"
 	modeldomain "github.com/chenyme/grok2api/backend/internal/domain/model"
 	infraegress "github.com/chenyme/grok2api/backend/internal/infra/egress"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
+	"github.com/chenyme/grok2api/backend/internal/repository"
 )
 
 const qualityProbeMaxStreamBytes = 4 << 20
@@ -44,6 +46,10 @@ type qualityProbeChatEvent struct {
 			ReasoningTokens int64 `json:"reasoning_tokens"`
 		} `json:"completion_tokens_details"`
 	} `json:"usage"`
+}
+
+type qualityProbeBuildRouteEnsurer interface {
+	EnsureQualityProbeBuildRoute(context.Context, string) error
 }
 
 func (s *Service) ProbeEgressQuality(ctx context.Context, nodeID uint64, input egressapp.QualityProbeInput) (egressapp.QualityProbeResult, error) {
@@ -75,7 +81,11 @@ func (s *Service) ProbeEgressQuality(ctx context.Context, nodeID uint64, input e
 	if !ok {
 		return egressapp.QualityProbeResult{}, fmt.Errorf("%w: 质量探测模型必须属于 Grok Build", egressapp.ErrInvalidInput)
 	}
+	if err := s.ensureQualityProbeBuildRoute(ctx, publicModel, input.Model); err != nil {
+		return egressapp.QualityProbeResult{}, err
+	}
 	probeCtx := infraegress.WithQualityProbe(ctx)
+	probeCtx, egressTrace := infraegress.WithTrace(probeCtx)
 	result, err := s.CreateChatCompletion(probeCtx, Input{
 		RequestID: requestID, ClientKey: key, PublicModel: publicModel, Body: body,
 		Streaming: true, Operation: audit.OperationChat, ForcedEgressNodeID: nodeID,
@@ -191,13 +201,59 @@ func (s *Service) ProbeEgressQuality(ctx context.Context, nodeID uint64, input e
 		outputTokensPerSecond = qualityProbeOutputTokensPerSecond(usage.OutputTokens, usage.ReasoningTokens, durationMS, firstTokenMS)
 	}
 	digest := sha256.Sum256([]byte(text))
+	attribution := qualityProbeAttribution(egressTrace, nodeID)
 	return egressapp.QualityProbeResult{
-		RequestID: requestID, NodeID: nodeID, Model: input.Model, StatusCode: result.StatusCode,
+		RequestID: requestID, NodeID: nodeID, Model: input.Model,
+		AttributionAvailable: attribution.available, AccountID: attribution.accountID, EgressIPLeaseID: attribution.leaseID, EgressIPRecordID: attribution.ipRecordID, BuildBotFlagSource: attribution.botFlagSource,
+		StatusCode:   result.StatusCode,
 		FirstTokenMS: firstTokenMS, DurationMS: durationMS, GenerationMS: generationMS,
 		ChunkCount: chunkCount, OutputTokens: usage.OutputTokens, ReasoningTokens: usage.ReasoningTokens,
 		VisibleTokens: visibleTokens, VisibleCharacters: visibleCharacters, OutputTokensPerSecond: outputTokensPerSecond,
 		ExpectedMatched: egressapp.MatchExpected(text, input.Expected, input.MatchMode), ResponseSHA256: hex.EncodeToString(digest[:]),
 	}, nil
+}
+
+type qualityProbeAttributionSnapshot struct {
+	available     bool
+	accountID     uint64
+	leaseID       uint64
+	ipRecordID    uint64
+	botFlagSource int
+}
+
+func qualityProbeAttribution(trace *infraegress.Trace, nodeID uint64) qualityProbeAttributionSnapshot {
+	selection, ok := trace.Selection(egressdomain.ScopeBuild)
+	if !ok || selection.NodeID != nodeID || selection.AccountID == 0 {
+		return qualityProbeAttributionSnapshot{}
+	}
+	return qualityProbeAttributionSnapshot{
+		available: true, accountID: selection.AccountID, leaseID: selection.EgressIPLeaseID,
+		ipRecordID: selection.EgressIPRecordID, botFlagSource: selection.BuildBotFlagSource,
+	}
+}
+
+func (s *Service) ensureQualityProbeBuildRoute(ctx context.Context, publicModel, upstreamModel string) error {
+	if s.models == nil {
+		return fmt.Errorf("%w: 质量探测模型路由未初始化", egressapp.ErrQualityProbeUnavailable)
+	}
+	if _, err := s.models.GetByPublicID(ctx, publicModel); err == nil {
+		return nil
+	} else if !errors.Is(err, repository.ErrNotFound) {
+		s.logger.Warn("quality_probe_model_route_lookup_failed", "provider", accountdomain.ProviderBuild, "model", upstreamModel, "error", err)
+		return fmt.Errorf("%w: 质量探测模型路由读取失败", egressapp.ErrQualityProbeUnavailable)
+	}
+	ensurer, ok := s.models.(qualityProbeBuildRouteEnsurer)
+	if !ok {
+		return fmt.Errorf("%w: 质量探测模型路由缺失", egressapp.ErrQualityProbeUnavailable)
+	}
+	if err := ensurer.EnsureQualityProbeBuildRoute(ctx, upstreamModel); err != nil {
+		s.logger.Warn("quality_probe_model_route_ensure_failed", "provider", accountdomain.ProviderBuild, "model", upstreamModel, "error", err)
+		return fmt.Errorf("%w: 质量探测模型路由补齐失败", egressapp.ErrQualityProbeUnavailable)
+	}
+	if _, err := s.models.GetByPublicID(ctx, publicModel); err != nil {
+		return fmt.Errorf("%w: 质量探测模型路由暂不可用", egressapp.ErrQualityProbeUnavailable)
+	}
+	return nil
 }
 
 func qualityProbeBuildPublicModel(value string) (string, bool) {

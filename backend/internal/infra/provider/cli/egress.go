@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -22,7 +23,13 @@ func (t *egressTransport) RoundTrip(request *http.Request) (*http.Response, erro
 	if affinity == "" {
 		affinity = "bootstrap"
 	}
-	lease, configured, err := t.manager.AcquireIfConfigured(request.Context(), domainegress.ScopeBuild, affinity)
+	lease, configured, err := t.manager.AcquireBuildCredentialIfLeaseEnabled(request.Context())
+	if err != nil {
+		return nil, err
+	}
+	if !configured {
+		lease, configured, err = t.manager.AcquireIfConfigured(request.Context(), domainegress.ScopeBuild, affinity)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -46,6 +53,7 @@ func (t *egressTransport) RoundTrip(request *http.Request) (*http.Response, erro
 			return response, requestErr
 		}
 	}
+	infraegress.RecordBuildLeaseAttribution(request.Context(), lease)
 	if lease.UserAgent != "" {
 		request.Header.Set("User-Agent", lease.UserAgent)
 	}
@@ -59,12 +67,51 @@ func (t *egressTransport) RoundTrip(request *http.Request) (*http.Response, erro
 		return nil, err
 	}
 	t.manager.FeedbackForScope(context.WithoutCancel(request.Context()), domainegress.ScopeBuild, lease.NodeID, response.StatusCode, nil)
+	t.manager.ObserveBuildLeaseRequest(request.Context(), lease, response.StatusCode)
 	if response.Body == nil {
 		lease.Release()
 		return response, nil
 	}
-	response.Body = &egressResponseBody{ReadCloser: t.wrapStreamIdleBody(response.Body, idleRequest.Context()), release: lease.Release}
+	body := t.wrapStreamIdleBody(response.Body, idleRequest.Context())
+	if response.StatusCode >= 200 && response.StatusCode < 300 && lease.EgressIPLeaseID != 0 {
+		body = newRiskObservingBody(body, func(reasoningObserved bool) {
+			t.manager.ObserveBuildLeaseOutcome(request.Context(), lease, response.StatusCode, reasoningObserved)
+		})
+	}
+	response.Body = &egressResponseBody{ReadCloser: body, release: lease.Release}
 	return response, nil
+}
+
+type riskObservingBody struct {
+	io.ReadCloser
+	buffer    []byte
+	completed bool
+	finalize  func(bool)
+}
+
+func newRiskObservingBody(body io.ReadCloser, finalize func(bool)) io.ReadCloser {
+	return &riskObservingBody{ReadCloser: body, finalize: finalize}
+}
+
+func (b *riskObservingBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if n > 0 && len(b.buffer) < 256<<10 {
+		remaining := (256 << 10) - len(b.buffer)
+		captured := min(n, remaining)
+		b.buffer = append(b.buffer, p[:captured]...)
+	}
+	if err == io.EOF && !b.completed {
+		b.completed = true
+		if b.finalize != nil {
+			b.finalize(buildReasoningObserved(b.buffer))
+		}
+	}
+	return n, err
+}
+
+func buildReasoningObserved(value []byte) bool {
+	value = bytes.ToLower(value)
+	return bytes.Contains(value, []byte("thinking_content")) || bytes.Contains(value, []byte(`"type":"reasoning"`)) || bytes.Contains(value, []byte("response.reasoning_text.delta"))
 }
 
 // withStreamIdleContext returns a shallow copy of request carrying a

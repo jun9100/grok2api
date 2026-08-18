@@ -62,11 +62,17 @@ var errClientCacheInvalidated = errors.New("egress client cache invalidated")
 var errAccountConnectionIsolationDisabled = errors.New("egress account connection isolation disabled")
 var errBuildIPLeaseUnavailable = errors.New("Build 出口 IP 租约不可用")
 
+// ErrBuildEgressIPExcluded is returned only for an in-flight request that
+// explicitly requires a different observed Build egress IP. It does not mark
+// the account or the durable IP lease unhealthy.
+var ErrBuildEgressIPExcluded = errors.New("Build 出口 IP 被本次请求排除")
+
 type Lease struct {
 	NodeID           uint64
 	NodeName         string
 	Scope            domain.Scope
 	EgressIPLeaseID  uint64
+	EgressIPRecordID uint64
 	ExitIP           string
 	ProxyURL         string
 	UserAgent        string
@@ -202,12 +208,17 @@ type buildIPLeaseRepository interface {
 	repository.EgressIPLeaseRepository
 }
 
+type buildEgressRiskObservationRepository interface {
+	repository.EgressRiskObservationRepository
+}
+
 // BuildIPLeaseConfig is deliberately fail-closed: enabled Build requests must
 // prove their account-specific IPv4 before using an upstream transport.
 type BuildIPLeaseConfig struct {
 	Enabled            bool
 	MaxAccountsPerIPv4 int
 	LeaseTTL           time.Duration
+	VerifyInterval     time.Duration
 }
 
 func (value BuildIPLeaseConfig) normalized() BuildIPLeaseConfig {
@@ -216,6 +227,9 @@ func (value BuildIPLeaseConfig) normalized() BuildIPLeaseConfig {
 	}
 	if value.LeaseTTL <= 0 {
 		value.LeaseTTL = 30 * time.Minute
+	}
+	if value.VerifyInterval <= 0 {
+		value.VerifyInterval = 5 * time.Minute
 	}
 	return value
 }
@@ -402,7 +416,7 @@ func (m *Manager) UpdateBuildIPLeaseConfig(value BuildIPLeaseConfig) {
 	m.buildLeaseMu.Lock()
 	m.buildLeaseConfig = value
 	m.buildLeaseMu.Unlock()
-	m.log().Info("build_egress_ip_lease_config_updated", "enabled", value.Enabled, "max_accounts_per_ipv4", value.MaxAccountsPerIPv4, "lease_ttl", value.LeaseTTL)
+	m.log().Info("build_egress_ip_lease_config_updated", "enabled", value.Enabled, "max_accounts_per_ipv4", value.MaxAccountsPerIPv4, "lease_ttl", value.LeaseTTL, "verify_interval", value.VerifyInterval)
 }
 
 func (m *Manager) buildIPLeaseConfigValue() BuildIPLeaseConfig {
@@ -528,6 +542,61 @@ func (m *Manager) AcquireCredential(ctx context.Context, scope domain.Scope, cre
 	return lease, err
 }
 
+// AcquireBuildCredentialIfLeaseEnabled activates the account-specific Build IP
+// lease only when the caller attached a persisted Build credential. Control
+// flows without an account, such as OAuth bootstrap, keep their legacy path.
+func (m *Manager) AcquireBuildCredentialIfLeaseEnabled(ctx context.Context) (*Lease, bool, error) {
+	if !m.buildIPLeaseConfigValue().Enabled {
+		return nil, false, nil
+	}
+	credential, ok := credentialFromContext(ctx)
+	if !ok || credential.Provider != accountdomain.ProviderBuild {
+		return nil, false, nil
+	}
+	lease, err := m.AcquireCredential(ctx, domain.ScopeBuild, credential)
+	return lease, true, err
+}
+
+// ObserveBuildLeaseRequest persists an attribution-only observation after a
+// Build response header arrives. Failures are logged and never affect traffic.
+func (m *Manager) ObserveBuildLeaseRequest(ctx context.Context, lease *Lease, statusCode int) {
+	if lease == nil || lease.EgressIPLeaseID == 0 {
+		return
+	}
+	credential, ok := credentialFromContext(ctx)
+	if !ok || credential.Provider != accountdomain.ProviderBuild {
+		return
+	}
+	riskRepository, ok := m.repository.(buildEgressRiskObservationRepository)
+	if !ok {
+		return
+	}
+	err := riskRepository.ObserveBuildEgressRequest(context.WithoutCancel(ctx), domain.BuildRequestObservation{
+		LeaseID: lease.EgressIPLeaseID, AccountID: credential.ID, BotFlagSource: credential.BuildBotFlagSource, StatusCode: statusCode, ObservedAt: time.Now().UTC(),
+	})
+	if err != nil {
+		m.log().Warn("build_egress_request_observation_failed", "lease_id", lease.EgressIPLeaseID, "account_id", credential.ID, "status_code", statusCode, "error", err)
+	}
+}
+
+func (m *Manager) ObserveBuildLeaseOutcome(ctx context.Context, lease *Lease, statusCode int, reasoningObserved bool) {
+	if lease == nil || lease.EgressIPLeaseID == 0 {
+		return
+	}
+	credential, ok := credentialFromContext(ctx)
+	model := buildRiskModelFromContext(ctx)
+	if !ok || credential.Provider != accountdomain.ProviderBuild || model == "" {
+		return
+	}
+	riskRepository, ok := m.repository.(buildEgressRiskObservationRepository)
+	if !ok {
+		return
+	}
+	if err := riskRepository.ObserveBuildEgressOutcome(context.WithoutCancel(ctx), domain.BuildResponseOutcome{LeaseID: lease.EgressIPLeaseID, AccountID: credential.ID, Model: model, StatusCode: statusCode, ReasoningObserved: reasoningObserved, ObservedAt: time.Now().UTC()}); err != nil {
+		m.log().Warn("build_egress_outcome_observation_failed", "lease_id", lease.EgressIPLeaseID, "account_id", credential.ID, "error", err)
+	}
+}
+
 func (m *Manager) acquireBuildCredentialWithIPLease(ctx context.Context, credential accountdomain.Credential) (*Lease, error) {
 	leaseRepository, ok := m.repository.(buildIPLeaseRepository)
 	if !ok {
@@ -536,6 +605,9 @@ func (m *Manager) acquireBuildCredentialWithIPLease(ctx context.Context, credent
 	config := m.buildIPLeaseConfigValue()
 	now := time.Now().UTC()
 	if existing, err := leaseRepository.GetActiveBuildEgressIPLease(ctx, credential.ID, now); err == nil {
+		if IsBuildEgressIPRecordExcluded(ctx, existing.IPRecordID) {
+			return nil, fmt.Errorf("%w: %d", ErrBuildEgressIPExcluded, existing.IPRecordID)
+		}
 		boundContext := WithEgressNode(ctx, existing.EgressNodeID)
 		lease, _, acquireErr := m.acquire(boundContext, domain.ScopeBuild, strconv.FormatUint(credential.ID, 10), false, credential.EncryptedCloudflareCookie, existing.EgressNodeID)
 		if acquireErr != nil {
@@ -548,6 +620,55 @@ func (m *Manager) acquireBuildCredentialWithIPLease(ctx context.Context, credent
 			return nil, fmt.Errorf("%w: 租约节点 %d 不可用", errBuildIPLeaseUnavailable, existing.EgressNodeID)
 		}
 		lease.EgressIPLeaseID = existing.ID
+		lease.EgressIPRecordID = existing.IPRecordID
+		lease.ExitIP = existing.ExitIP
+		if !buildLeaseNeedsVerification(existing, now, config.VerifyInterval) {
+			return lease, nil
+		}
+
+		probe, probeErr := m.probeBuildLeaseIPv4(ctx, lease)
+		if probeErr != nil {
+			lease.Release()
+			if releaseErr := leaseRepository.ReleaseEgressIPLease(ctx, existing.ID, "exit IP verification failed", now); releaseErr != nil {
+				return nil, fmt.Errorf("%w: 释放验证失败租约: %v", errBuildIPLeaseUnavailable, releaseErr)
+			}
+			return nil, fmt.Errorf("%w: 复验账号出口 IPv4: %v", errBuildIPLeaseUnavailable, probeErr)
+		}
+		recordID, observeErr := leaseRepository.ObserveBuildEgressIPv4(ctx, lease.NodeID, probe)
+		if observeErr != nil {
+			lease.Release()
+			return nil, fmt.Errorf("%w: 记录复验出口 IPv4: %v", errBuildIPLeaseUnavailable, observeErr)
+		}
+		if recordID != existing.IPRecordID {
+			if releaseErr := leaseRepository.ReleaseEgressIPLease(ctx, existing.ID, "exit IP changed", now); releaseErr != nil {
+				lease.Release()
+				return nil, fmt.Errorf("%w: 释放变更出口租约: %v", errBuildIPLeaseUnavailable, releaseErr)
+			}
+			if IsBuildEgressIPRecordExcluded(ctx, recordID) {
+				lease.Release()
+				return nil, fmt.Errorf("%w: %d", ErrBuildEgressIPExcluded, recordID)
+			}
+			reassigned, _, acquireErr := leaseRepository.AcquireBuildEgressIPLease(ctx, domain.IPLeaseAcquireInput{
+				IPRecordID: recordID, AccountID: credential.ID, EgressNodeID: lease.NodeID,
+				MaxAccounts: config.MaxAccountsPerIPv4, Now: now, ExpiresAt: now.Add(config.LeaseTTL),
+			})
+			if acquireErr != nil {
+				lease.Release()
+				return nil, fmt.Errorf("%w: 分配变更出口 IPv4: %v", errBuildIPLeaseUnavailable, acquireErr)
+			}
+			lease.EgressIPLeaseID = reassigned.ID
+			lease.EgressIPRecordID = reassigned.IPRecordID
+			lease.ExitIP = probe.IPv4.ExitIP
+			return lease, nil
+		}
+		renewed, renewErr := leaseRepository.RenewBuildEgressIPLease(ctx, existing.ID, now, now.Add(config.LeaseTTL))
+		if renewErr != nil {
+			lease.Release()
+			return nil, fmt.Errorf("%w: 更新出口租约验证时间: %v", errBuildIPLeaseUnavailable, renewErr)
+		}
+		lease.EgressIPLeaseID = renewed.ID
+		lease.EgressIPRecordID = renewed.IPRecordID
+		lease.ExitIP = probe.IPv4.ExitIP
 		return lease, nil
 	} else if !errors.Is(err, repository.ErrNotFound) {
 		return nil, fmt.Errorf("%w: 查询账号租约: %v", errBuildIPLeaseUnavailable, err)
@@ -573,6 +694,10 @@ func (m *Manager) acquireBuildCredentialWithIPLease(ctx context.Context, credent
 		lease.Release()
 		return nil, fmt.Errorf("%w: 记录账号出口 IPv4: %v", errBuildIPLeaseUnavailable, err)
 	}
+	if IsBuildEgressIPRecordExcluded(ctx, recordID) {
+		lease.Release()
+		return nil, fmt.Errorf("%w: %d", ErrBuildEgressIPExcluded, recordID)
+	}
 	ipLease, _, err := leaseRepository.AcquireBuildEgressIPLease(ctx, domain.IPLeaseAcquireInput{
 		IPRecordID: recordID, AccountID: credential.ID, EgressNodeID: lease.NodeID,
 		MaxAccounts: config.MaxAccountsPerIPv4, Now: now, ExpiresAt: now.Add(config.LeaseTTL),
@@ -582,8 +707,16 @@ func (m *Manager) acquireBuildCredentialWithIPLease(ctx context.Context, credent
 		return nil, fmt.Errorf("%w: 分配账号出口 IPv4: %v", errBuildIPLeaseUnavailable, err)
 	}
 	lease.EgressIPLeaseID = ipLease.ID
+	lease.EgressIPRecordID = ipLease.IPRecordID
 	lease.ExitIP = probe.IPv4.ExitIP
 	return lease, nil
+}
+
+func buildLeaseNeedsVerification(lease domain.IPLease, now time.Time, interval time.Duration) bool {
+	if lease.LastVerifiedAt == nil || lease.LastVerifiedAt.IsZero() {
+		return true
+	}
+	return !lease.LastVerifiedAt.Add(interval).After(now)
 }
 
 func (m *Manager) probeBuildLeaseIPv4(ctx context.Context, lease *Lease) (domain.ProbeResult, error) {
@@ -1284,7 +1417,12 @@ func (m *Manager) leaseForNodeWithOptions(ctx context.Context, scope domain.Scop
 		return nil, false, err
 	}
 	m.incrementInflight(selected.ID)
-	recordSelection(ctx, Selection{NodeID: selected.ID, NodeName: selected.Name, Scope: scope, Proxied: proxyURL != ""})
+	selection := Selection{NodeID: selected.ID, NodeName: selected.Name, Scope: scope, Proxied: proxyURL != ""}
+	if credential, ok := credentialFromContext(ctx); ok && credential.Provider == accountdomain.ProviderBuild {
+		selection.AccountID = credential.ID
+		selection.BuildBotFlagSource = credential.BuildBotFlagSource
+	}
+	recordSelection(ctx, selection)
 	var once sync.Once
 	return &Lease{NodeID: selected.ID, NodeName: selected.Name, Scope: scope, ProxyURL: proxyURL, UserAgent: userAgent, CFCookies: cookies, client: client.client, browser: client.browser, sticky: sticky, proxyPool: proxyPool, freshTunnel: freshTunnel, clearanceKey: clearanceKey, clearanceManager: m, release: func() {
 		once.Do(func() {

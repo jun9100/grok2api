@@ -203,6 +203,13 @@ qualityGuard:
   nodeIDs: [2, 9]
   minimumHealthyNodes: 1
   activeInterval: 45m
+  zeroTokenRetry:
+    enabled: true
+    maxAttempts: 2
+  requestRetry:
+    enabled: true
+    agentOutcomeGuard: true
+    agentStallTurns: 5
 `)
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatal(err)
@@ -214,6 +221,12 @@ qualityGuard:
 	if !value.QualityGuard.Enabled || value.QualityGuard.DeprecatedClientKeyID != 999 || value.QualityGuard.ActiveInterval.Value() != 45*time.Minute {
 		t.Fatalf("qualityGuard = %#v", value.QualityGuard)
 	}
+	if !value.QualityGuard.ZeroTokenRetry.Enabled || value.QualityGuard.ZeroTokenRetry.MaxAttempts != 2 {
+		t.Fatalf("qualityGuard.zeroTokenRetry = %#v", value.QualityGuard.ZeroTokenRetry)
+	}
+	if !value.QualityGuard.RequestRetry.Enabled || !value.QualityGuard.RequestRetry.AgentOutcomeGuard || value.QualityGuard.RequestRetry.AgentStallTurns != 5 {
+		t.Fatalf("qualityGuard.requestRetry = %#v", value.QualityGuard.RequestRetry)
+	}
 }
 
 func TestEnabledQualityGuardUsesManagedIdentity(t *testing.T) {
@@ -224,6 +237,28 @@ func TestEnabledQualityGuardUsesManagedIdentity(t *testing.T) {
 	value.QualityGuard.Enabled = true
 	if err := value.Validate(); err != nil {
 		t.Fatalf("enabled quality guard should not require a client key ID: %v", err)
+	}
+}
+
+func TestValidateRejectsTooManyZeroTokenRetryAttempts(t *testing.T) {
+	value := defaultConfig()
+	value.Secrets.JWTSecret = "12345678901234567890123456789012"
+	value.Secrets.CredentialEncryptionKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+	value.BootstrapAdmin.Password = "password123"
+	value.QualityGuard.ZeroTokenRetry = QualityGuardZeroTokenRetryConfig{Enabled: true, MaxAttempts: 3}
+	if err := value.Validate(); err == nil || !strings.Contains(err.Error(), "qualityGuard.zeroTokenRetry.maxAttempts") {
+		t.Fatalf("Validate error = %v, want zeroTokenRetry maxAttempts rejection", err)
+	}
+}
+
+func TestValidateRejectsInvalidAgentStallTurns(t *testing.T) {
+	value := defaultConfig()
+	value.Secrets.JWTSecret = "12345678901234567890123456789012"
+	value.Secrets.CredentialEncryptionKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+	value.BootstrapAdmin.Password = "password123"
+	value.QualityGuard.RequestRetry = QualityGuardRequestRetryConfig{Enabled: true, AgentOutcomeGuard: true, AgentStallTurns: 1}
+	if err := value.Validate(); err == nil || !strings.Contains(err.Error(), "qualityGuard.requestRetry.agentStallTurns") {
+		t.Fatalf("Validate error = %v, want agentStallTurns rejection", err)
 	}
 }
 

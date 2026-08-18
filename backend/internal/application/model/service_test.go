@@ -3,6 +3,7 @@ package model
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"net/http"
 	"path/filepath"
@@ -58,6 +59,35 @@ func TestNormalizeBatchIDsAllowsGroupedRouteExpansion(t *testing.T) {
 	ids = append(ids, uint64(maxModelBatchSize+1))
 	if _, err := normalizeModelRouteBatchIDs(ids); err == nil {
 		t.Fatal("oversized grouped batch was accepted")
+	}
+}
+
+func TestEnsureQualityProbeBuildRouteCreatesManagedRouteIdempotently(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "quality-probe-route.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	modelRepo := relational.NewModelRepository(database)
+	service := NewService(modelRepo, relational.NewAccountRepository(database), nil, nil)
+	for range 2 {
+		if err := service.EnsureQualityProbeBuildRoute(ctx, "grok-4.5"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	route, err := modelRepo.GetByPublicIDIncludingDisabled(ctx, "Build/grok-4.5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if route.Provider != account.ProviderBuild || route.UpstreamModel != "grok-4.5" || route.Capability != modeldomain.CapabilityResponses || route.Origin != modeldomain.OriginDiscovered || !route.Enabled {
+		t.Fatalf("route = %#v", route)
+	}
+	if err := service.EnsureQualityProbeBuildRoute(ctx, "Console/grok-4.5"); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("cross-provider model error = %v", err)
 	}
 }
 

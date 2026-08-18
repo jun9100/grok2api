@@ -1,11 +1,49 @@
 package gateway
 
 import (
+	"context"
 	"errors"
 	"testing"
 
 	egressapp "github.com/chenyme/grok2api/backend/internal/application/egress"
+	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
+	modeldomain "github.com/chenyme/grok2api/backend/internal/domain/model"
+	"github.com/chenyme/grok2api/backend/internal/repository"
 )
+
+type qualityProbeRouteResolverStub struct {
+	route       modeldomain.Route
+	ensureCalls int
+}
+
+func (r *qualityProbeRouteResolverStub) Get(context.Context, uint64) (modeldomain.Route, error) {
+	return r.route, nil
+}
+
+func (r *qualityProbeRouteResolverStub) GetByPublicID(context.Context, string) (modeldomain.Route, error) {
+	if r.route.ID == 0 {
+		return modeldomain.Route{}, repository.ErrNotFound
+	}
+	return r.route, nil
+}
+
+func (r *qualityProbeRouteResolverStub) GetByPublicIDCandidates(ctx context.Context, publicID string) ([]modeldomain.Route, error) {
+	route, err := r.GetByPublicID(ctx, publicID)
+	if err != nil {
+		return nil, err
+	}
+	return []modeldomain.Route{route}, nil
+}
+
+func (r *qualityProbeRouteResolverStub) GetByProviderUpstream(context.Context, accountdomain.Provider, string) (modeldomain.Route, error) {
+	return r.route, nil
+}
+
+func (r *qualityProbeRouteResolverStub) EnsureQualityProbeBuildRoute(_ context.Context, upstreamModel string) error {
+	r.ensureCalls++
+	r.route = modeldomain.Route{ID: 7, PublicID: "Build/" + upstreamModel, Provider: accountdomain.ProviderBuild, UpstreamModel: upstreamModel, Capability: modeldomain.CapabilityResponses, Enabled: true}
+	return nil
+}
 
 func TestQualityProbeSelectionFailureCanBeIdentifiedByCaller(t *testing.T) {
 	err := normalizeQualityProbeRequestError(errors.Join(ErrNoAvailableAccount, &SelectionUnavailableError{Reason: SelectionCooling}))
@@ -21,6 +59,23 @@ func TestQualityProbeModelIsPinnedToBuildNamespace(t *testing.T) {
 	}
 	if _, ok := qualityProbeBuildPublicModel("Console/grok-shared"); ok {
 		t.Fatal("quality probe must reject an explicitly non-Build model")
+	}
+}
+
+func TestQualityProbeRepairsMissingBuildRouteBeforeSelection(t *testing.T) {
+	models := &qualityProbeRouteResolverStub{}
+	service := &Service{models: models}
+	if err := service.ensureQualityProbeBuildRoute(context.Background(), "Build/grok-4.5", "grok-4.5"); err != nil {
+		t.Fatal(err)
+	}
+	if models.ensureCalls != 1 || models.route.ID == 0 || models.route.Provider != accountdomain.ProviderBuild {
+		t.Fatalf("ensure calls=%d route=%#v", models.ensureCalls, models.route)
+	}
+	if err := service.ensureQualityProbeBuildRoute(context.Background(), "Build/grok-4.5", "grok-4.5"); err != nil {
+		t.Fatal(err)
+	}
+	if models.ensureCalls != 1 {
+		t.Fatalf("existing route was repaired again: calls=%d", models.ensureCalls)
 	}
 }
 

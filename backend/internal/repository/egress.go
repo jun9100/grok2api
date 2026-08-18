@@ -21,7 +21,19 @@ type EgressIPLeaseRepository interface {
 	GetActiveBuildEgressIPLease(context.Context, uint64, time.Time) (egress.IPLease, error)
 	ObserveBuildEgressIPv4(context.Context, uint64, egress.ProbeResult) (uint64, error)
 	AcquireBuildEgressIPLease(context.Context, egress.IPLeaseAcquireInput) (egress.IPLease, bool, error)
+	RenewBuildEgressIPLease(context.Context, uint64, time.Time, time.Time) (egress.IPLease, error)
 	ReleaseEgressIPLease(context.Context, uint64, string, time.Time) error
+}
+
+// EgressRiskObservationRepository is intentionally optional while Build IP
+// leases remain an opt-in feature. Observations never participate in routing.
+type EgressRiskObservationRepository interface {
+	ObserveBuildEgressRequest(context.Context, egress.BuildRequestObservation) error
+	ObserveBuildEgressOutcome(context.Context, egress.BuildResponseOutcome) error
+}
+
+type BuildEgressRiskSummaryRepository interface {
+	ListBuildEgressRiskSummaries(context.Context, time.Time, int) ([]egress.BuildEgressRiskSummary, error)
 }
 
 // EgressNodePageRepository is the bounded management-list contract. Runtime

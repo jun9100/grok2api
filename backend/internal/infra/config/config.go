@@ -237,6 +237,7 @@ type EgressLeaseConfig struct {
 	Enabled            bool     `yaml:"enabled"`
 	MaxAccountsPerIPv4 int      `yaml:"maxAccountsPerIPv4"`
 	LeaseTTL           Duration `yaml:"leaseTTL"`
+	VerifyInterval     Duration `yaml:"verifyInterval"`
 }
 
 type AuditConfig struct {
@@ -277,6 +278,33 @@ type QualityGuardConfig struct {
 	RotationToken           string   `yaml:"rotationToken"`
 	RotationTimeout         Duration `yaml:"rotationTimeout"`
 	RotatableNodeIDs        []uint64 `yaml:"rotatableNodeIDs"`
+	// RequestRetry withholds a thinking-model stream that already has enough
+	// visible output and no reasoning, then retries on another account.
+	RequestRetry QualityGuardRequestRetryConfig `yaml:"requestRetry"`
+	// ZeroTokenRetry retries one Build stream that ends before any model output
+	// is sent to the client. It is independent from missing-thinking recovery.
+	ZeroTokenRetry QualityGuardZeroTokenRetryConfig `yaml:"zeroTokenRetry"`
+}
+
+// QualityGuardRequestRetryConfig holds the in-process missing-thinking withhold policy.
+type QualityGuardRequestRetryConfig struct {
+	Enabled           bool     `yaml:"enabled"`
+	MaxAttempts       int      `yaml:"maxAttempts"`
+	HoldTimeout       Duration `yaml:"holdTimeout"`
+	MinOutputTokens   int      `yaml:"minOutputTokens"`
+	AccountCooldown   Duration `yaml:"accountCooldown"`
+	OnExhausted       string   `yaml:"onExhausted"`
+	ToolActionGuard   bool     `yaml:"toolActionGuard"`
+	AgentOutcomeGuard bool     `yaml:"agentOutcomeGuard"`
+	AgentStallTurns   int      `yaml:"agentStallTurns"`
+}
+
+// QualityGuardZeroTokenRetryConfig bounds transparent Build stream recovery
+// before an SSE frame is exposed downstream. MaxAttempts counts the original
+// upstream attempt plus the one permitted retry.
+type QualityGuardZeroTokenRetryConfig struct {
+	Enabled     bool `yaml:"enabled"`
+	MaxAttempts int  `yaml:"maxAttempts"`
 }
 
 type ClientKeyDefaultsConfig struct {
@@ -629,7 +657,7 @@ func (c Config) Validate() error {
 	if c.Routing.StickyTTL.Value() <= 0 || c.Routing.StickyTTL.Value() > maxRoutingTTL || c.Routing.CooldownBase.Value() <= 0 || c.Routing.CooldownMax.Value() < c.Routing.CooldownBase.Value() || c.Routing.CooldownMax.Value() > maxRoutingCooldown || c.Routing.CapacityWait.Value() <= 0 || c.Routing.CapacityWait.Value() > maxRoutingCapacityWait || (c.Routing.MaxAttempts < unlimitedRoutingAttempts || c.Routing.MaxAttempts == 0 || c.Routing.MaxAttempts > maxRoutingAttempts) || (c.Routing.VideoMaxAttempts < unlimitedRoutingAttempts || c.Routing.VideoMaxAttempts > maxRoutingAttempts) {
 		return errors.New("routing 配置无效")
 	}
-	if c.EgressLease.MaxAccountsPerIPv4 < 1 || c.EgressLease.MaxAccountsPerIPv4 > 100000 || c.EgressLease.LeaseTTL.Value() < time.Minute || c.EgressLease.LeaseTTL.Value() > 24*time.Hour {
+	if c.EgressLease.MaxAccountsPerIPv4 < 1 || c.EgressLease.MaxAccountsPerIPv4 > 100000 || c.EgressLease.LeaseTTL.Value() < time.Minute || c.EgressLease.LeaseTTL.Value() > 24*time.Hour || c.EgressLease.VerifyInterval.Value() < time.Minute || c.EgressLease.VerifyInterval.Value() > 24*time.Hour {
 		return errors.New("egressLease 配置无效")
 	}
 	if c.Routing.SegmentedMinCandidates < 100 || c.Routing.SegmentedMinCandidates > 1000000 ||
@@ -688,6 +716,12 @@ func (c Config) Validate() error {
 }
 
 func validateQualityGuardConfig(value QualityGuardConfig) error {
+	if err := validateQualityGuardRequestRetry(value.RequestRetry); err != nil {
+		return err
+	}
+	if err := validateQualityGuardZeroTokenRetry(value.ZeroTokenRetry); err != nil {
+		return err
+	}
 	if !value.Enabled {
 		return nil
 	}
@@ -735,6 +769,43 @@ func validateQualityGuardConfig(value QualityGuardConfig) error {
 		if err != nil || parsed.Host == "" || parsed.User != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
 			return errors.New("qualityGuard.rotationURL 必须是无凭据的 HTTP(S) URL")
 		}
+	}
+	return nil
+}
+
+func validateQualityGuardRequestRetry(value QualityGuardRequestRetryConfig) error {
+	if !value.Enabled {
+		return nil
+	}
+	if value.MaxAttempts != 0 && (value.MaxAttempts < 1 || value.MaxAttempts > 6) {
+		return errors.New("qualityGuard.requestRetry.maxAttempts 必须在 1 到 6 之间")
+	}
+	if d := value.HoldTimeout.Value(); d != 0 && (d < 200*time.Millisecond || d > 30*time.Second) {
+		return errors.New("qualityGuard.requestRetry.holdTimeout 必须在 200ms 到 30s 之间")
+	}
+	if value.MinOutputTokens != 0 && (value.MinOutputTokens < 8 || value.MinOutputTokens > 256) {
+		return errors.New("qualityGuard.requestRetry.minOutputTokens 必须在 8 到 256 之间")
+	}
+	if d := value.AccountCooldown.Value(); d != 0 && (d < 10*time.Second || d > 24*time.Hour) {
+		return errors.New("qualityGuard.requestRetry.accountCooldown 必须在 10 秒到 24 小时之间")
+	}
+	if value.AgentStallTurns != 0 && (value.AgentStallTurns < 2 || value.AgentStallTurns > 64) {
+		return errors.New("qualityGuard.requestRetry.agentStallTurns 必须在 2 到 64 之间")
+	}
+	switch strings.TrimSpace(value.OnExhausted) {
+	case "", "fail_open", "fail_closed":
+	default:
+		return errors.New("qualityGuard.requestRetry.onExhausted 必须是 fail_open 或 fail_closed")
+	}
+	return nil
+}
+
+func validateQualityGuardZeroTokenRetry(value QualityGuardZeroTokenRetryConfig) error {
+	if !value.Enabled {
+		return nil
+	}
+	if value.MaxAttempts != 0 && (value.MaxAttempts < 1 || value.MaxAttempts > 2) {
+		return errors.New("qualityGuard.zeroTokenRetry.maxAttempts 必须为 1 或 2")
 	}
 	return nil
 }
@@ -851,7 +922,7 @@ func defaultConfig() Config {
 			ReasoningReplayTTL:          Duration(time.Hour),
 			ReasoningReplayMaxEntries:   10240,
 		},
-		EgressLease: EgressLeaseConfig{MaxAccountsPerIPv4: 3, LeaseTTL: Duration(30 * time.Minute)},
+		EgressLease: EgressLeaseConfig{MaxAccountsPerIPv4: 3, LeaseTTL: Duration(30 * time.Minute), VerifyInterval: Duration(5 * time.Minute)},
 		Audit: AuditConfig{
 			BufferSize: 16384, BatchSize: 256, FlushInterval: Duration(250 * time.Millisecond), CommitDelay: Duration(5 * time.Millisecond),
 			LedgerMode: "enforce", LedgerFailureThreshold: 1,

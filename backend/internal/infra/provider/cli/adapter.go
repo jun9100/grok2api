@@ -511,6 +511,7 @@ func (a *Adapter) doResponseRequest(ctx context.Context, request provider.Respon
 		bodyReader = bytes.NewReader(body)
 	}
 	requestCtx := infraegress.WithCredential(ctx, request.Credential)
+	requestCtx = infraegress.WithBuildRiskModel(requestCtx, request.Model)
 	if request.ForcedEgressNodeID != 0 {
 		requestCtx = infraegress.WithEgressNode(requestCtx, request.ForcedEgressNodeID)
 	}

@@ -102,6 +102,8 @@ egressLease:
   enabled: false
   maxAccountsPerIPv4: 3
   leaseTTL: 30m
+  # [通常不要修改] 同一账号 sticky 出口的重新验证间隔；IP 变化或验证失败时不复用旧租约。
+  verifyInterval: 5m
 
 audit:
   # [通常不要修改] 审计批量写入参数；bufferSize 的修改需重启生效。
@@ -142,3 +144,32 @@ qualityGuard:
   rotationTimeout: 45s
   nodeIDs: []
   rotatableNodeIDs: []
+  # Optional request-path withhold/retry for thinking models. Disabled by default.
+  # Missing thinking with enough visible output is not delivered; another account
+  # is tried (up to maxAttempts). fail_closed returns 503 instead of the last body.
+  requestRetry:
+    enabled: false
+    maxAttempts: 6
+    holdTimeout: 3s
+    minOutputTokens: 32
+    # Keep an account out of rotation after a confirmed missing-thinking response.
+    accountCooldown: 10m
+    onExhausted: fail_closed # fail_open | fail_closed
+    # Legacy Anthropic-only compatibility mode. It uses request-text heuristics
+    # and remains disabled when the structured outcome guard is used.
+    toolActionGuard: false
+    # Protocol-neutral Agent outcome guard for Claude Messages, OpenAI Chat,
+    # and Responses/Codex. It activates only when request metadata carries
+    # agent_contract or grok_agent_contract, for example:
+    # {"requires":["mutation","verification"]}
+    # The gateway then verifies structured tool-result status, never final
+    # natural-language claims. A prior failed write/patch also activates a
+    # narrow mutation recovery without client metadata.
+    agentOutcomeGuard: false
+    agentStallTurns: 6
+  # Optional Build-only stream recovery. The service holds the stream until
+  # its first model output; a zero-token transport interruption retries once
+  # on a different account and a different observed egress IP.
+  zeroTokenRetry:
+    enabled: false
+    maxAttempts: 2
