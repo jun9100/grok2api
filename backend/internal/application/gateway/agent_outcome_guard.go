@@ -40,11 +40,18 @@ func agentOutcomeRequirementFromRequest(body []byte, protocol string, stallTurns
 	}
 	ledger.finishObservationTail()
 	if !explicitContract {
-		// A failed Write/Edit/Patch is an unambiguous structured fact, unlike a
-		// natural-language request. Retry only this narrow case even when the
-		// client cannot yet supply an explicit contract.
-		if ledger.failed.has(toolCapabilityMutation) {
+		// A failed mutation, command, or verification result is an unambiguous
+		// structured fact, unlike a natural-language request. Keep a recovery
+		// contract open even when native agent clients cannot attach metadata.
+		if ledger.failed.has(toolCapabilityVerification) {
+			contract.RequiresExecution = true
+			contract.RequiresVerification = true
+		} else if ledger.failed.has(toolCapabilityMutation) {
+			// Shell writes carry execution too; a failed write still primarily
+			// needs a successful mutation, not an unrelated command rerun.
 			contract.RequiresMutation = true
+		} else if ledger.failed.has(toolCapabilityExecution) {
+			contract.RequiresExecution = true
 		} else if ledger.observationActions >= implicitEmptyTerminalObservationThreshold(stallTurns) {
 			// Native agent clients such as Claude Code cannot attach a per-turn
 			// outcome contract. A terminal response with no text and no next tool

@@ -140,6 +140,70 @@ func TestAgentOutcomeGuardRecoversFailedMutationWithoutContract(t *testing.T) {
 	}
 }
 
+func TestAgentOutcomeGuardRecoversFailedVerificationWithoutContract(t *testing.T) {
+	t.Parallel()
+	body := []byte(`{
+  "messages":[
+    {"role":"assistant","tool_calls":[{"id":"test-1","type":"function","function":{"name":"Bash","arguments":"{\"command\":\"npm test\"}"}}]},
+    {"role":"tool","tool_call_id":"test-1","content":"{\"exit_code\":1}"}
+  ]
+}`)
+	requirement := agentOutcomeRequirementFromRequest(body, qualityProtocolChat, 6)
+	if !requirement.Enabled || !requirement.ContractOpen || requirement.RequiresMutation || !requirement.RequiresExecution || !requirement.RequiresVerification {
+		t.Fatalf("implicit failed-verification recovery = %#v", requirement)
+	}
+
+	replay, verdict, code, _, _, err := peekQualityStream(
+		context.Background(),
+		io.NopCloser(strings.NewReader(sse(
+			`data: {"choices":[{"delta":{"content":"Tests pass now."},"finish_reason":"stop"}]}`,
+		))),
+		qualityProtocolChat,
+		QualityRetryRuntime{Enabled: true, AgentOutcomeGuard: true, HoldTimeout: time.Millisecond},
+		requirement,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = replay.Close()
+	if verdict != QualityWithhold || code != ErrorAgentContractUnfulfilled {
+		t.Fatalf("implicit failed-verification recovery = verdict=%s code=%q", verdict, code)
+	}
+}
+
+func TestAgentOutcomeGuardAllowsSuccessfulVerificationRecoveryWithoutContract(t *testing.T) {
+	t.Parallel()
+	body := []byte(`{
+  "messages":[
+    {"role":"assistant","tool_calls":[{"id":"test-1","type":"function","function":{"name":"Bash","arguments":"{\"command\":\"npm test\"}"}}]},
+    {"role":"tool","tool_call_id":"test-1","content":"{\"exit_code\":1}"},
+    {"role":"assistant","tool_calls":[{"id":"test-2","type":"function","function":{"name":"Bash","arguments":"{\"command\":\"npm test\"}"}}]},
+    {"role":"tool","tool_call_id":"test-2","content":"{\"exit_code\":0}"}
+  ]
+}`)
+	requirement := agentOutcomeRequirementFromRequest(body, qualityProtocolChat, 6)
+	if !requirement.contractSatisfied() || !requirement.VerifiedExecution || !requirement.VerifiedVerification {
+		t.Fatalf("successful verification recovery = %#v", requirement)
+	}
+
+	replay, verdict, code, _, _, err := peekQualityStream(
+		context.Background(),
+		io.NopCloser(strings.NewReader(sse(
+			`data: {"choices":[{"delta":{"content":"Tests pass now."},"finish_reason":"stop"}]}`,
+		))),
+		qualityProtocolChat,
+		QualityRetryRuntime{Enabled: true, AgentOutcomeGuard: true, HoldTimeout: time.Millisecond},
+		requirement,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = replay.Close()
+	if verdict != QualityDeliver || code != "" {
+		t.Fatalf("successful verification recovery = verdict=%s code=%q", verdict, code)
+	}
+}
+
 func TestAgentOutcomeRequirementChatLedger(t *testing.T) {
 	t.Parallel()
 	body := []byte(`{
